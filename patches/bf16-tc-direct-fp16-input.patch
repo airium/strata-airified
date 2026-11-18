@@ -1,0 +1,108 @@
+diff --git a/src/prefill/gemm.cu b/src/prefill/gemm.cu
+index 595846a9..8f05b3c7 100644
+--- a/src/prefill/gemm.cu
++++ b/src/prefill/gemm.cu
+@@ -1111,14 +1111,23 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
+         // no room even for a tile says so.  A single output row stays cuBLAS's GEMV for path 1 (faster than the
+         // conversions).  Every tile is a disjoint block of Y, so each gets the caller's beta.
+         const int mult = path == 2 ? 2 : 1;   // 2-byte elements per converted value
++        // An xn16 image already contains the FP16 values the tensor-core GEMM
++        // reads. Its size is not bounded by the BF16 conversion scratch. Keep
++        // the original sliced route unless this focused CUDA experiment is asked for.
++        static const bool wide_x = [] {
++            const char* e = std::getenv("STRATA_BF16_TC_WIDE_X");
++            return e != nullptr && e[0] == '1';
++        }();
++        const bool direct_x = wide_x && path == 1 && x_f16 && ldx == 0;
+         int64_t w_rows = N;
+-        int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
++        int64_t x_rows = direct_x ? T : std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
+         bool fit = false;
+         for (;;) {
+-            if (grow(tc_w_, tc_w_elems_, mult * w_rows * K) && grow(tc_x_, tc_x_elems_, mult * x_rows * K)) { fit = true; break; }
+-            if (w_rows <= 64 && x_rows <= 64) break;
++            if (grow(tc_w_, tc_w_elems_, mult * w_rows * K) &&
++                (direct_x || grow(tc_x_, tc_x_elems_, mult * x_rows * K))) { fit = true; break; }
++            if (w_rows <= 64 && (direct_x || x_rows <= 64)) break;
+             w_rows = std::max<int64_t>(std::min<int64_t>(w_rows, 64), w_rows / 2);
+-            x_rows = std::max<int64_t>(std::min<int64_t>(x_rows, 64), x_rows / 2);
++            if (!direct_x) x_rows = std::max<int64_t>(std::min<int64_t>(x_rows, 64), x_rows / 2);
+         }
+         if (!fit && path == 2) {   // Pascal has no BF16 cuBLAS call to fall back to; Volta keeps its raw one below
+             std::fprintf(stderr, "prefill gemm: no GPU memory left for the %s conversion buffers of a %lld x %lld BF16 weight "
+diff --git a/src/prefill/gemm_bf16_parity.cu b/src/prefill/gemm_bf16_parity.cu
+index a9470051..c6e1658e 100644
+--- a/src/prefill/gemm_bf16_parity.cu
++++ b/src/prefill/gemm_bf16_parity.cu
+@@ -11,6 +11,7 @@
+ #include "strata/prefill/gemm.hpp"
+ 
+ #include <cublas_v2.h>
++#include <cuda_fp16.h>
+ #include <cuda_runtime.h>
+ 
+ #include <algorithm>
+@@ -40,8 +41,14 @@ bool ok_or(cudaError_t e, const char* what) {
+ struct Shape {
+     int64_t T, N, K, ldy;
+     const char* what;
++    bool fp16_image = false;
+ };
+ 
++__global__ void test_fp16_image(const uint16_t* in, uint16_t* out, int64_t n) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) out[i] = __half_as_ushort(__float2half_rn(__uint_as_float((uint32_t) in[i] << 16)));
++}
++
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+@@ -69,6 +76,8 @@ int main(int argc, char** argv) {
+         {300, 4, 10240, 0, "hc inject"},
+         {2048, 1, 2560, 0, "single row"},
+         {333, 128, 2560, 136, "row stride wider than N"},
++        {8192, 320, 10240, 0, "hc down, existing FP16 image", true},
++        {8192, 4, 10240, 0, "hc inject, existing FP16 image", true},
+     };
+     std::mt19937 rng(1234);
+     std::normal_distribution<float> nd(0.0f, 1.0f);
+@@ -82,7 +91,7 @@ int main(int argc, char** argv) {
+             xlo[i] = to_bf16(1e-3f * nd(rng));       // a bf16x2 low part
+         }
+         for (auto& v : w) v = to_bf16(0.02f * nd(rng));
+-        uint16_t *dx = nullptr, *dxlo = nullptr, *dw = nullptr;
++        uint16_t *dx = nullptr, *dxlo = nullptr, *dw = nullptr, *dx_image = nullptr;
+         float *dy = nullptr, *dr = nullptr;
+         const size_t ybytes = (size_t) (s.T * ldy) * 4;
+         bool ok = ok_or(cudaMalloc((void**) &dx, x.size() * 2), "x") && ok_or(cudaMalloc((void**) &dxlo, x.size() * 2), "xlo") &&
+@@ -95,8 +104,14 @@ int main(int argc, char** argv) {
+         cudaMemset(dy, 0, ybytes);
+         cudaMemset(dr, 0, ybytes);
+ 
++        const uint16_t* under_test = dx;
++        if (s.fp16_image) {
++            if (!ok_or(cudaMalloc((void**) &dx_image, x.size() * 2), "FP16 image")) return 1;
++            test_fp16_image<<<(unsigned) ((x.size() + 255) / 256), 256, 0, st>>>(dx, dx_image, (int64_t) x.size());
++            under_test = dx_image;
++        }
+         // the product under test: X . W^T, then the low part added with beta = 1
+-        gemm.bf16(dx, dw, dy, s.T, s.N, s.K, ldy);
++        gemm.bf16(under_test, dw, dy, s.T, s.N, s.K, ldy, 0.0f, 0, s.fp16_image);
+         gemm.bf16(dxlo, dw, dy, s.T, s.N, s.K, ldy, 1.0f);
+         // the reference: cuBLAS on the BF16 inputs, the same two calls
+         const float one = 1.0f, zero = 0.0f;
+@@ -141,12 +156,12 @@ int main(int argc, char** argv) {
+                 cudaStreamSynchronize(st);
+                 return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 20;
+             };
+-            const double us_gemm = time([&] { gemm.bf16(dx, dw, dy, s.T, s.N, s.K, ldy); });
++            const double us_gemm = time([&] { gemm.bf16(under_test, dw, dy, s.T, s.N, s.K, ldy, 0.0f, 0, s.fp16_image); });
+             const double us_ref = time([&] { ref(dx, zero); });
+             std::printf("      bench: Gemm::bf16 %9.1f us   cuBLAS BF16 %9.1f us   (%.2fx)\n", us_gemm, us_ref,
+                         us_ref / us_gemm);
+         }
+-        cudaFree(dx); cudaFree(dxlo); cudaFree(dw); cudaFree(dy); cudaFree(dr);
++        cudaFree(dx_image); cudaFree(dx); cudaFree(dxlo); cudaFree(dw); cudaFree(dy); cudaFree(dr);
+     }
+     cublasDestroy(h);
+     cudaStreamDestroy(st);

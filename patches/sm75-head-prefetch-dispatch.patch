@@ -1,0 +1,31 @@
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index 21d3392f..a8a5a8b7 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -2283,7 +2283,25 @@ void launch_il(const void* weights, const void* x_il, float* y, int n_in, int n_
+ template <typename I>
+ void launch_il_rows(int r, const void* weights, const void* x_il, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+     int pf_rows = 0;
+-    const int pf = il_pf_for(I::F::TYPE, ncols, n_out, &pf_rows);
++    int pf = il_pf_for(I::F::TYPE, ncols, n_out, &pf_rows);
++    // The paired cold operator screen on both2080Ti cards only supported a
++    // head-specific choice.  In particular, do not select the four-row pf3
++    // instance: its register spills can make it several times slower.
++    static const bool head_pf = [] { const char* e = std::getenv("STRATA_SM75_HEAD_PF"); return e && e[0] == '1'; }();
++    if (head_pf && I::F::TYPE == 14 && n_in == 2560 && n_out == 248320 && ncols >= 2 && ncols <= 4 &&
++        g_il_pf < 0 && std::getenv("STRATA_MMVQ_IL_PF") == nullptr) {
++        static int cc[64] = {};
++        int dev = 0;
++        if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) {
++            if (!cc[dev]) {
++                int major = 0, minor = 0;
++                cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
++                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
++                cc[dev] = major == 7 && minor == 5 ? 2 : 1;
++            }
++            if (cc[dev] == 2) { pf = 3; pf_rows = 2; }
++        }
++    }
+     if (pf_rows != 0) r = pf_rows;   // the pf table measured its rows with its kernel
+     if (ncols > 4 && r == 4) r = 2;   // 5..8 columns: 1 or 2 rows a warp
+     switch (r) {

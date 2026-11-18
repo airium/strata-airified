@@ -1,0 +1,91 @@
+diff --git a/include/strata/kernels/cpu/numa_pool.hpp b/include/strata/kernels/cpu/numa_pool.hpp
+index 176ac7ec..87b3c2e0 100644
+--- a/include/strata/kernels/cpu/numa_pool.hpp
++++ b/include/strata/kernels/cpu/numa_pool.hpp
+@@ -87,8 +87,8 @@ struct NumaSplitDecision {
+     bool on = false;
+     std::string why;               ///< the reason when off
+     int slices = 2;
+-    int nodes[kMaxNumaSlices] = {-1, -1, -1, -1};       ///< the two node ids, ascending
+-    std::vector<int> slice;        ///< each thread's slice (0 or 1)
++    int nodes[kMaxNumaSlices] = {-1, -1, -1, -1};       ///< real node ids, ascending
++    std::vector<int> slice;        ///< each thread's owner index
+     int per[kMaxNumaSlices] = {};           ///< threads per slice
+ };
+ 
+diff --git a/include/strata/kernels/cpu/pool.hpp b/include/strata/kernels/cpu/pool.hpp
+index f01725f1..1f0e3a3f 100644
+--- a/include/strata/kernels/cpu/pool.hpp
++++ b/include/strata/kernels/cpu/pool.hpp
+@@ -167,13 +167,13 @@ ThreadAffinity pin_current_thread(int core);
+ void restore_thread_affinity(const ThreadAffinity& previous);
+ 
+ /// STRATA_NUMA_SPLIT's decision for a pool (see `ExpertPool`'s NodeSync).  `1` splits on the real NUMA nodes of
+-/// the pinned threads (Linux, exactly 2 nodes); `test` splits by thread index (thread j -> slice j % 2) with no real
+-/// node, for the parity test.
++/// the pinned threads (Linux, exactly 2 nodes); `4` explicitly selects four nodes.
++/// `test` / `test4` split by thread index, with no memory placement, for parity tests.
+ struct NumaSplitPlan {
+     bool on = false;                  ///< split enabled
+     bool test = false;                ///< STRATA_NUMA_SPLIT=test: no real nodes, never places memory
+     int slices = 2;
+-    int nodes[kMaxNumaSlices] = {-1, -1, -1, -1};          ///< real node id of slice 0 and 1 (ascending); -1 in test mode
++    int nodes[kMaxNumaSlices] = {-1, -1, -1, -1};          ///< real node ids, ascending; -1 in test mode
+     std::vector<int> cores[kMaxNumaSlices];        ///< the cores the pool pinned for each slice (workers + host)
+     std::string why;                  ///< reason when off ("" when on, or when the env var is unset)
+ };
+@@ -218,7 +218,7 @@ public:
+     std::string placement_line() const;
+     int plan_cores() const { return plan_cores_; }
+     int plan_logical() const { return plan_logical_; }
+-    /// STRATA_NUMA_SPLIT: 2 when the native row phases are split per NUMA node, 0 when off.
++    /// STRATA_NUMA_SPLIT: 2 or 4 when native row phases are split per NUMA node, 0 when off.
+     int numa_slices() const { return numa_n_; }
+     /// Accumulated drain time of slice `s` over the mode-5/6 phases, ms: publish to the slice's last `done`.
+     double numa_slice_ms(int s) const { return s >= 0 && s < numa_n_ ? slice_ms_[s] : 0.0; }
+@@ -370,8 +370,8 @@ private:
+     const NativeFmt* nfmt_ = nullptr;
+     NativeArithmetic narithmetic_ = NativeArithmetic::Default;
+     std::vector<SplitBufMulti> split_multi_;
+-    // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
+-    // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the
++    // STRATA_NUMA_SPLIT=1/4 (Linux, exactly 2/4 nodes): in native row phases (modes 5/6) every expert's rows
++    // are cut into N slices (slice k = rows [per*k/N, per*(k+1)/N) of the gate/up or down matrix, the
+     // part the resident complement places on node k in step B), and each node's threads claim and count on their own
+     // slice's counters; in every mode they park on their own `parked`.  Off (`numa_n_ == 0`, the decision is final in
+     // the constructor): none of this is touched and the pool is as before.
+@@ -391,13 +391,13 @@ private:
+         alignas(64) int base = 0;   // the slice's first task index in the phase (task ids are global for `diag`)
+         int tasks = 0;              // T: the slice's task count
+         int h = 0;                  // rows of each expert in the slice
+-        int row0 = 0;               // the slice's first matrix row (per*k/2)
++        int row0 = 0;               // the slice's first matrix row (per*k/numa_n_)
+         int64_t rows = 0;           // R = experts * h
+     };
+     // CBA: the NodeSync blocks live wherever `new` puts them (the host's node); per-node pages if the remote home
+     // of a line ever shows up in the counters.
+     std::unique_ptr<NodeSync[]> nsync_;
+-    int numa_n_ = 0;                  // slices (2 when on), 0 = off
++    int numa_n_ = 0;                  // slices (2 or 4 when on), 0 = off
+     std::vector<int> wslice_;         // each worker's slice
+     int hslice_ = 0;                  // the host's slice (when it drains)
+     std::vector<int> slice_threads_;  // threads draining each slice (the host counted in its own)
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index d807cf2c..142f2308 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -5973,6 +5973,14 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
+ #else
+     static const bool arena_mmap = [] { const char* v = std::getenv("STRATA_ARENA_MMAP"); return v && v[0] == '1'; }();
+     if (arena_mmap) {
++#if defined(__linux__)
++        // Refuse before the reusable-file fast path: it returns before first-touch planning.
++        const auto& plan = strata::kernels::cpu::active_numa_split();
++        if (plan.on && !plan.test && plan.slices == 4) {
++            err = "four-node arena placement requires a private native GGUF arena (no mmap/shared/pin-by-need)";
++            return false;
++        }
++#endif
+         const uint64_t file_bytes = want + (uint64_t) blob;
+         uint64_t have = 0;
+         {

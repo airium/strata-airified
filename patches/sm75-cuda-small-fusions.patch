@@ -1,0 +1,24 @@
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 8d920881..5640ae12 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -471,7 +471,8 @@ bool fuse_convab_on() {
+     static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_CONVAB"); return v != nullptr && std::atoi(v) != 0; }();
+     return on;
+ #else
+-    return false;
++    static const bool requested = [] { const char* e = std::getenv("STRATA_FUSE_CONVAB"); return e && e[0] == '1'; }();
++    return requested && device_is_sm75();
+ #endif
+ }
+ 
+@@ -489,7 +490,8 @@ bool fuse_hits_on() {
+     }
+     return per_dev[dev] == 2;
+ #else
+-    return false;
++    static const bool requested = [] { const char* e = std::getenv("STRATA_FUSE_HITS"); return e && e[0] == '1'; }();
++    return requested && device_is_sm75();
+ #endif
+ }
+ 

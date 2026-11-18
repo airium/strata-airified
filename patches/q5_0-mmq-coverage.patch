@@ -1,0 +1,15 @@
+diff --git a/tests/cuda/prefill_mmq_kquant_test.cpp b/tests/cuda/prefill_mmq_kquant_test.cpp
+index aa54ad47..116f36c2 100644
+--- a/tests/cuda/prefill_mmq_kquant_test.cpp
++++ b/tests/cuda/prefill_mmq_kquant_test.cpp
+@@ -159,6 +159,10 @@ int main() {
+                 product(ctx, s, ("Q6_K gate/up" + tag).c_str(), GGML_TYPE_Q6_K, 1280, 2560, counts, trial + 17);
+                 product(ctx, s, ("Q5_1 down" + tag).c_str(), GGML_TYPE_Q5_1, 2560, 640, counts, trial + 9);
+                 product(ctx, s, ("Q8_0 down" + tag).c_str(), GGML_TYPE_Q8_0, 2560, 640, counts, trial + 13);
++                // OrcaRouter Q4_K_M mixes Q8_0 and Q5_0 down matrices. The optional
++                // Q5_0 instance needs the same independent layout/zero-row screen.
++                if (mmq::supported((int) GGML_TYPE_Q5_0))
++                    product(ctx, s, ("Q5_0 down" + tag).c_str(), GGML_TYPE_Q5_0, 2560, 640, counts, trial + 23);
+                 ++trial;
+             }
+         }

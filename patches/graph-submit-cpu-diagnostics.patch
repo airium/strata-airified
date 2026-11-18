@@ -1,0 +1,71 @@
+diff --git a/include/strata/core/host_graph_launch.hpp b/include/strata/core/host_graph_launch.hpp
+index 48fbb831..9b774604 100644
+--- a/include/strata/core/host_graph_launch.hpp
++++ b/include/strata/core/host_graph_launch.hpp
+@@ -3,6 +3,9 @@
+ #include <cuda_runtime.h>
+ #include <atomic>
+ #include <condition_variable>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <functional>
+ #include <mutex>
+ #include <thread>
+@@ -13,6 +16,31 @@
+ 
+ namespace strata::core {
+ 
++namespace host_launch_detail {
++// CPU-only diagnostic, independent of Nsight interception and the watchdog
++// probe's sleeps/join.  The timer brackets only cudaGraphLaunch.  Report once
++// per128 submissions, not once per layer/window.  Off: no clock reads or locks.
++inline cudaError_t submit(cudaGraphExec_t graph, cudaStream_t stream, int device) {
++    static const bool timed = [] { const char* e = std::getenv("STRATA_GRAPH_SUBMIT_TIMING"); return e && e[0] == '1'; }();
++    if (!timed) return cudaGraphLaunch(graph, stream);
++    const auto start = std::chrono::steady_clock::now();
++    const cudaError_t error = cudaGraphLaunch(graph, stream);
++    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
++    struct Stats { unsigned long long n = 0; double sum = 0, maximum = 0; };
++    static Stats stats[64];
++    static std::mutex mu;
++    std::lock_guard<std::mutex> lock(mu);
++    Stats& s = stats[device >= 0 && device < 64 ? device : 0];
++    ++s.n; s.sum += us; if (us > s.maximum) s.maximum = us;
++    if (s.n == 128) {
++        std::fprintf(stderr, "strata graph submit: device %d submissions %llu mean_us %.3f max_us %.3f (CPU timer, launch call only)\n",
++                     device, s.n, s.sum / (double) s.n, s.maximum);
++        s = {};
++    }
++    return error;
++}
++} // namespace host_launch_detail
++
+ // One submission thread per verifier/device, not per window.  The engine's host
+ // thread is pinned: a new thread otherwise inherits that same CPU and competes
+ // with the doorbell service this overlap is meant to unblock.  Use the existing
+@@ -63,7 +91,7 @@ private:
+             cudaError_t error;
+             {
+                 host_profile::Range submit("strata.graph.submit", (uint64_t) device_);
+-                error = device_error == cudaSuccess ? cudaGraphLaunch(graph, stream) : device_error;
++                error = device_error == cudaSuccess ? host_launch_detail::submit(graph, stream, device_) : device_error;
+             }
+             lock.lock();
+             error_ = error;
+@@ -98,13 +126,13 @@ public:
+             worker_ = std::thread([this, graph, device] {
+                 host_profile::Range submit("strata.graph.submit", (uint64_t) device);
+                 auto error = cudaSetDevice(device);
+-                if (error == cudaSuccess) error = cudaGraphLaunch(graph, stream_);
++                if (error == cudaSuccess) error = host_launch_detail::submit(graph, stream_, device);
+                 error_ = error;
+                 pending_.store(false, std::memory_order_release);
+             });
+         } else {
+             host_profile::Range submit("strata.graph.submit", (uint64_t) device);
+-            error_ = cudaGraphLaunch(graph, stream_);
++            error_ = host_launch_detail::submit(graph, stream_, device);
+         }
+     }
+     HostGraphLaunch(const HostGraphLaunch&) = delete;

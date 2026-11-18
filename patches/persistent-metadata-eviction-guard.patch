@@ -1,0 +1,12 @@
+diff --git a/serve/persistent_prefix.py b/serve/persistent_prefix.py
+index 3a29e0e1..790345c1 100644
+--- a/serve/persistent_prefix.py
++++ b/serve/persistent_prefix.py
+@@ -241,6 +241,6 @@ class PersistentPrefixCache:
+             key=file.name[:64];meta=file.parent/(key+'.json')
+             try:
+                 row=json.loads(meta.read_text())
+-                if row.get('file')==file.name:meta.unlink()
++                if isinstance(row,dict) and row.get('file')==file.name:meta.unlink()
+             except (OSError,ValueError):pass
+             total-=size;self.stats['evictions']+=1

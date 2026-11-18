@@ -1,0 +1,13 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index dd279d017..143fce940 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -12160,7 +12160,7 @@ int main(int argc, char** argv) {
+                 // Only explicit values extend the legacy default key.
+                 for (const char* name : {"STRATA_HC_Q8", "STRATA_HC_Q8_INJECT", "STRATA_HC_REQ8", "STRATA_GR_V3",
+                         "STRATA_GR_V3_SM75", "STRATA_HC_Q32_SM75", "STRATA_QFUSE_HC", "STRATA_FUSE_CONVAB",
+-                        "STRATA_FUSE_HITS", "STRATA_SM75_HEAD_PF", "STRATA_MMVQ_IL_PF", "STRATA_QFUSE"})
++                        "STRATA_FUSE_HITS", "STRATA_SM75_HEAD_PF", "STRATA_MMVQ_IL_PF", "STRATA_QFUSE", "STRATA_HC_NATIVE"})
+                     if (const char* value = std::getenv(name))
+                         c.runtime_key += std::string(";") + name + "=" + value;
+                 c.runtime_key += ";stage0=" + std::to_string(ss.layer_lo) + ":" + std::to_string(ss.layer_hi);

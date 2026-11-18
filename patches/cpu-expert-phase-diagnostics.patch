@@ -1,0 +1,38 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 6eb2037b..1fba9061 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -12489,6 +12489,9 @@ int main(int argc, char** argv) {
+             int ckpts = 0;
+             double sync_ms = 0.0, save_ms = 0.0, evict_ms = 0.0, read_ms = 0.0, windows_ms = 0.0;
+         } req_times;
++        double req_pool_gu0=0, req_pool_q0=0, req_pool_down0=0;
++        uint64_t req_pool_bytes0=0;
++        double req_pool_slices0[strata::kernels::cpu::kMaxNumaSlices] = {};
+         auto gpu_sync_ok = [&]() -> bool {
+             const cudaError_t e = cudaDeviceSynchronize();
+             if (e == cudaSuccess) return true;
+@@ -16831,6 +16834,9 @@ int main(int argc, char** argv) {
+             if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
+             tr("request", n, geni ? 1 : 0);
+             req_times = ReqTimes{};
++            req_pool_gu0=pool.ms_multi_gu; req_pool_q0=pool.ms_multi_q; req_pool_down0=pool.ms_multi_down;
++            req_pool_bytes0=pool.multi_bytes;
++            for (int k=0;k<pool.numa_slices();++k) req_pool_slices0[k]=pool.numa_slice_ms(k);
+             if (use_mtp) mtp.set_prompt_len(n);
+             // KVA: the draft layer's first real cell for the state this request continues from (0 for a cold read - the
+             // first segment raises it if KVA approximates it - and for any state no KVA read produced)
+@@ -19756,6 +19762,13 @@ int main(int argc, char** argv) {
+                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
+                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
+             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
++            if (const char* stats=std::getenv("STRATA_POOL_SUMMARY"); stats && std::atoi(stats)!=0) {
++                std::fprintf(stderr,"strata CPU_POOL_STAT prompt=%lld generated=%lld gu_ms=%.3f quant_ms=%.3f down_ms=%.3f logical_weight_bytes=%llu slices=%d",
++                    (long long)n,(long long)produced_n,pool.ms_multi_gu-req_pool_gu0,pool.ms_multi_q-req_pool_q0,
++                    pool.ms_multi_down-req_pool_down0,(unsigned long long)(pool.multi_bytes-req_pool_bytes0),pool.numa_slices());
++                for (int k=0;k<pool.numa_slices();++k) std::fprintf(stderr," s%d_ms=%.3f",k,pool.numa_slice_ms(k)-req_pool_slices0[k]);
++                std::fprintf(stderr,"\n");
++            }
+             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
+                         "experts_streamed=%lld\n",
+                         (long long) produced_n,

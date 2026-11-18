@@ -1,0 +1,453 @@
+diff --git a/include/strata/core/weights.hpp b/include/strata/core/weights.hpp
+index fe3723120..8e051ca05 100644
+--- a/include/strata/core/weights.hpp
++++ b/include/strata/core/weights.hpp
+@@ -93,6 +93,10 @@ struct WeightRef {
+     /// S23 experiment (STRATA_HC_Q8=1): a hyper-connection projection's Q8_0 bytes as the GGUF stores them, owned by
+     /// NativeDense, for the verify window's read (every other path keeps the pack's BF16 `data`)
+     const void* hc_q8 = nullptr;
++    /// STRATA_HC_NATIVE=1: this hyper-connection projection's GGUF blocks repacked for the native verify read
++    /// (kernels/fused_gr.hpp); fmt 0 Q4_K, 1 Q6_K, 2 Q5_0 rows.  Owned by NativeDense; `data` (BF16) is kept.
++    const void* hc_nq = nullptr;
++    int hc_nq_fmt = -1;
+     /// Plan v0.3 P1: false when the loader SKIPPED this tensor's canonical bytes because another form serves it
+     /// (native GGUF projections, the native head).  The metadata above stays valid; `data` is null.
+     bool resident = true;
+diff --git a/include/strata/kernels/fused_gr.hpp b/include/strata/kernels/fused_gr.hpp
+index fb32021cc..1b6b7d8f9 100644
+--- a/include/strata/kernels/fused_gr.hpp
++++ b/include/strata/kernels/fused_gr.hpp
+@@ -51,7 +51,21 @@ struct FusedGrArgs {
+     /// 32 contiguous values here ([row][col / 32]).  w_inject stays bf16.
+     const float* s_down = nullptr;
+     const float* s_up = nullptr;
++    /// STRATA_HC_NATIVE=1: the checkpoint's own hyper-connection blocks, repacked at load (WeightRef::hc_nq) and read
++    /// by the native multi read (FP32 activations, the GGUF's dequantized values exactly; another summation order than
++    /// the BF16 read).  nq_down: Q4_K (fmt 0, 144-byte superblocks) or Q6_K (fmt 1, 224-byte superblocks, f32 d);
++    /// nq_up: Q5_0 rows in the lane-major 320-byte layout (fmt 2); nq_inject: Q4_K rows (fmt 0), or null (no inject).
++    const uint8_t* nq_down = nullptr;
++    int nq_down_fmt = -1;
++    const uint8_t* nq_up = nullptr;
++    const uint8_t* nq_inject = nullptr;
+ };
++/// STRATA_HC_NATIVE layouts (bytes per unit) and the host repacks NativeDense uses (src: the GGUF tensor's bytes).
++constexpr int kHcNqQ4kBlock = 144, kHcNqQ6kBlock = 224, kHcNqQ5Row = 320;
++void hc_native_repack_q6k(const uint8_t* src, uint8_t* dst, int64_t n_blocks);
++void hc_native_repack_q5_0_rows(const uint8_t* src, uint8_t* dst, int64_t rows);   ///< rows of 320 values (10 blocks)
++/// The native read is ready on the current card (its scratch exists; fused_gr_check makes it).
++bool hc_native_ready();
+ 
+ bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
+ /// STRATA_HC_Q8: n int8 codes with one fp32 scale per 32 -> bf16 (the prompt path's GEMMs take bf16).
+diff --git a/src/core/native_dense.cpp b/src/core/native_dense.cpp
+index 80184ca7e..2cb1e75cb 100644
+--- a/src/core/native_dense.cpp
++++ b/src/core/native_dense.cpp
+@@ -294,7 +294,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+         std::vector<Pending> pending;
+         std::set<std::string> seen;
+         int max_in = 0;
+-        uint64_t total = 0, hc_q8_bytes = 0, allocated = 0, hc_q8_skipped_bytes = 0, hc_q8_skipped = 0;
++        uint64_t total = 0, hc_q8_bytes = 0, allocated = 0, hc_q8_skipped_bytes = 0, hc_q8_skipped = 0, hc_nq_bytes = 0, hc_nq_count = 0;
+         uint64_t split_count = 0, split_tensors = 0;
+         std::set<uint64_t> split_numbers;
+         bool have_architecture = false;
+@@ -443,6 +443,51 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+                                 : (v != nullptr && v[0] != '\0' && std::strcmp(v, "auto") != 0 ? "STRATA_HC_Q8 turned it off"
+                                                                                                : "off by default on this backend"));
+             }
++            // STRATA_HC_NATIVE=1: the layers' hyper-connection projections as the GGUF stores them (Q4_K / Q6_K down and
++            // inject rows, Q5_0 up rows), repacked for the native verify read (fused_gr.hpp); the pack's BF16 rows stay for
++            // every other path.  This stage's layers only; another encoding keeps the BF16 read for that projection.
++            static const bool hc_native = [] { const char* v = std::getenv("STRATA_HC_NATIVE"); return v != nullptr && v[0] == '1'; }();
++            if (hc_native)
++                for (const auto& tensor : gguf.tensors()) {
++                    const std::string& name = tensor.name;
++                    if (name.rfind("blk.", 0) != 0 || !hc_q8_name(name) || tensor.shape.size() != 2) continue;
++                    if (outside(name) || !in_range(name)) continue;
++                    auto found = table.table_.find(name);
++                    if (found == table.table_.end() || found->second.hc_nq != nullptr) continue;
++                    auto& ref = found->second;
++                    if (tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
++                        err = "native dense (STRATA_HC_NATIVE): incompatible matrix " + name; return false;
++                    }
++                    const bool down = name.ends_with("_down.weight"), up = name.ends_with("_up.weight"), inj = name.ends_with("_inject.weight");
++                    const uint8_t* src = (const uint8_t*) gguf.tensor_data(tensor);
++                    const uint64_t ne0 = tensor.shape[0], ne1 = tensor.shape[1];
++                    std::vector<uint8_t> host;
++                    int fmt = -1;
++                    if ((down || inj) && tensor.type == 12 && ne0 % 256 == 0) {   // Q4_K: the blocks as stored
++                        fmt = 0;
++                        host.assign(src, src + ne0 / 256 * 144 * ne1);
++                    } else if (down && tensor.type == 14 && ne0 % 256 == 0) {     // Q6_K: 224-byte blocks, f32 d
++                        fmt = 1;
++                        host.resize(ne0 / 256 * ne1 * strata::kernels::kHcNqQ6kBlock);
++                        strata::kernels::hc_native_repack_q6k(src, host.data(), (int64_t) (ne0 / 256 * ne1));
++                    } else if (up && tensor.type == 6 && ne0 == 320) {              // Q5_0 rows of 320: lane-major
++                        fmt = 2;
++                        host.resize(ne1 * strata::kernels::kHcNqQ5Row);
++                        strata::kernels::hc_native_repack_q5_0_rows(src, host.data(), (int64_t) ne1);
++                    } else continue;
++                    void* dev = nullptr;
++                    if (cudaMalloc(&dev, host.size()) != cudaSuccess ||
++                        cudaMemcpy(dev, host.data(), host.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
++                        err = "native dense (STRATA_HC_NATIVE) upload " + name; return false;
++                    }
++                    ref.hc_nq = dev;
++                    ref.hc_nq_fmt = fmt;
++                    weights_.push_back(dev);
++                    hc_nq_bytes += host.size();
++                    allocated += alloc_bytes(host.size());
++                    ++hc_nq_count;
++                    strata::core::manifest::instance().tensors("dense_hc_native_copy", fmt == 0 ? "Q4_K" : fmt == 1 ? "Q6_K->224" : "Q5_0->lane-major", 1, host.size());
++                }
+             if (hc_q8_env())
+                 for (const auto& tensor : gguf.tensors()) {
+                     // S25: the F32 inject rows hold BF16-exact values: the read takes the pack's BF16 rows unless
+@@ -566,6 +611,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+         allocated_ = allocated;
+         if (hc_q8_skipped != 0 && strata::core::manifest::enabled())   // STRATA_MANIFEST: what the stage filter did not copy
+             strata::core::manifest::instance().tensors("dense_hc_q8_out_of_stage_not_copied", "Q8_0", hc_q8_skipped, hc_q8_skipped_bytes);
++        if (hc_nq_count != 0)
++            std::fprintf(stderr, "strata: STRATA_HC_NATIVE=1: %llu hyper-connection projections read natively (%.1f MiB, BF16 rows kept)\n",
++                         (unsigned long long) hc_nq_count, (double) hc_nq_bytes / 1048576.0);
+         if (hc_q8_env())
+             std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",
+                          (double) hc_q8_bytes / 1073741824.0);
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 5640ae127..5181e694a 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -1605,6 +1605,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                 a.q8_down = (const uint8_t*) wd[half]->hc_q8; a.q8_up = (const uint8_t*) wu[half]->hc_q8;
+                 a.q8_inject = (const uint8_t*) wi[half]->hc_q8;
+                 a.s_down = wd[half]->q8_scale; a.s_up = wu[half]->q8_scale;
++                if (wd[half]->hc_nq != nullptr && wu[half]->hc_nq != nullptr && wi[half]->hc_nq != nullptr) {   // STRATA_HC_NATIVE
++                    a.nq_down = (const uint8_t*) wd[half]->hc_nq; a.nq_down_fmt = wd[half]->hc_nq_fmt;
++                    a.nq_up = (const uint8_t*) wu[half]->hc_nq; a.nq_inject = (const uint8_t*) wi[half]->hc_nq;
++                }
+                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
+                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
+                 if (qcnt_ != nullptr) {   // S26 STRATA_QFUSE: the consumer's q8_1 image written by the read itself
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index 1c3d4df8c..064fd25fe 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -2823,6 +2823,245 @@ static bool gr_up_pf_dispatch(int pf, int n_tok, const GrMulti& m, const float*
+ 
+ // One read of at most kFusedGrMaxT tokens: the kernels below are built for that many (the instantiations, the shared
+ // memory, the by-value launch argument), whatever the window is.
++// ================================ STRATA_HC_NATIVE: the checkpoint's own blocks ================================
++// The decode verify read with the GGUF's hyper-connection projections as stored (Q4_K / Q6_K down rows, Q5_0 up rows),
++// FP32 activations and the GGUF's dequantized values exactly (y = d*sc*q - dmin*m, d*(q - 16), d*sc*(q - 32)) - not the
++// pack's BF16 rounding of them.  3.2x fewer weight bytes than the BF16 rows.  The norm is gr_norm_split_kernel's; the
++// down projection is split over its 40 superblock columns (a warp = 8 rows x 1 superblock, the activations in
++// registers), the 40 partial sums are added in a fixed order by a small kernel (deterministic), and the up projection
++// reads each row's 10 Q5_0 blocks lane-major (lane l = element l of every block: the block scales are warp-uniform).
++// Another summation order than the BF16 read: not bitwise any other read.
++namespace hcnq {
++constexpr int NS = D / 256;                 // 40 superblocks a down row
++constexpr int ROWS = LR + HC;               // 320 down rows + the 4 inject rows
++constexpr int GROUPS = (ROWS + 7) / 8;      // 41 groups of 8 rows; group 40 = the inject rows
++constexpr int PART_T = kFusedGrMaxT;
++__device__ __forceinline__ float h2f(uint32_t bits16) { return __half2float(__ushort_as_half((unsigned short) (bits16 & 0xffffu))); }
++// an exact float of a small non-negative integer (q < 2^23) without the quarter-rate I2F: 2^23 + q, minus 2^23 + bias
++__device__ __forceinline__ float magic_minus(uint32_t q, float bias_plus_2p23) { return __int_as_float(0x4B000000u | q) - bias_plus_2p23; }
++__device__ __forceinline__ float warp_sum8_rows(const float (&a)[8], int lane) { return warp_sum8(a, lane); }   // sum of a[(lane >> 2) & 7]
++
++template <int FMT, int TT>
++__global__ void __launch_bounds__(256) down_kernel(GrMulti m, int t0, float* __restrict__ part) {
++    const int s = blockIdx.x, lane = threadIdx.x & 31, grp = blockIdx.y * 8 + (threadIdx.x >> 5);
++    if (grp >= GROUPS) return;
++    const bool inj = grp == LR / 8;
++    if (inj && m.a[0].nq_inject == nullptr) return;
++    float x[TT][8], sx[TT];
++#pragma unroll
++    for (int t = 0; t < TT; ++t) {
++        const float4* xp = reinterpret_cast<const float4*>(m.xn + (size_t) (t0 + t) * D + (size_t) s * 256 + lane * 8);
++        const float4 a = __ldg(xp), b = __ldg(xp + 1);
++        x[t][0] = a.x; x[t][1] = a.y; x[t][2] = a.z; x[t][3] = a.w; x[t][4] = b.x; x[t][5] = b.y; x[t][6] = b.z; x[t][7] = b.w;
++        sx[t] = ((a.x + a.y) + (a.z + a.w)) + ((b.x + b.y) + (b.z + b.w));
++    }
++    float p[8][TT];
++    if (FMT == 1 && !inj) {   // Q6_K: lane's 8 values: half n = lane >> 4, offset idx = (lane & 15) * 8 -> jl = idx >> 5, l0 = idx & 31
++        const int n = lane >> 4, idx = (lane & 15) * 8, jl = idx >> 5, l0 = idx & 31;
++        const int si = n * 8 + 2 * jl + (l0 >= 16 ? 1 : 0), s4 = 4 * (jl >> 1), s2 = 2 * jl;
++        uint2 ql[8], qh[8];
++        uint32_t scw[8];
++        float dd[8];
++#pragma unroll
++        for (int r = 0; r < 8; ++r) {
++            const uint8_t* blk = m.a[0].nq_down + ((size_t) (grp * 8 + r) * NS + s) * kHcNqQ6kBlock;
++            ql[r] = __ldg(reinterpret_cast<const uint2*>(blk + n * 64 + 32 * (jl & 1) + l0));
++            qh[r] = __ldg(reinterpret_cast<const uint2*>(blk + 128 + n * 32 + l0));
++            scw[r] = __ldg(reinterpret_cast<const uint32_t*>(blk + 192 + 4 * (si >> 2)));
++            dd[r] = __ldg(reinterpret_cast<const float*>(blk + 208));
++        }
++#pragma unroll
++        for (int r = 0; r < 8; ++r) {
++            const float a = dd[r] * (float) (int8_t) ((scw[r] >> (8 * (si & 3))) & 0xffu);   // ggml: d * sc, then * q
++            float q[8];
++#pragma unroll
++            for (int i = 0; i < 8; ++i) {
++                const uint32_t lw = i < 4 ? ql[r].x : ql[r].y, hw = i < 4 ? qh[r].x : qh[r].y;
++                q[i] = magic_minus(((lw >> (8 * (i & 3) + s4)) & 0xFu) | (((hw >> (8 * (i & 3) + s2)) & 3u) << 4), 8388640.0f);   // q - 32
++            }
++#pragma unroll
++            for (int t = 0; t < TT; ++t) {
++                float dq = q[0] * x[t][0];
++#pragma unroll
++                for (int i = 1; i < 8; ++i) dq = fmaf(q[i], x[t][i], dq);
++                p[r][t] = a * dq;
++            }
++        }
++    } else {                  // Q4_K (the down rows of fmt 0, and the inject rows)
++        const uint8_t* base = inj ? m.a[0].nq_inject : m.a[0].nq_down;
++        const int rbase = inj ? 0 : grp * 8, j = lane >> 2, sh = 4 * (j & 1);
++        uint4 hd[8];
++        uint2 qq[8];
++#pragma unroll
++        for (int r = 0; r < 8; ++r) {
++            const int rr = (!inj || r < HC) ? r : 0;
++            const uint8_t* blk = base + ((size_t) (rbase + rr) * NS + s) * kHcNqQ4kBlock;
++            hd[r] = __ldg(reinterpret_cast<const uint4*>(blk));
++            qq[r] = __ldg(reinterpret_cast<const uint2*>(blk + 16 + 32 * (j >> 1) + (lane & 3) * 8));
++        }
++#pragma unroll
++        for (int r = 0; r < 8; ++r) {
++            const uint32_t sw[3] = {hd[r].y, hd[r].z, hd[r].w};
++            auto byte = [&](int i) -> uint32_t { return (sw[i >> 2] >> (8 * (i & 3))) & 0xffu; };
++            uint32_t sc, mn;
++            if (j < 4) { sc = byte(j) & 63u; mn = byte(j + 4) & 63u; }
++            else { sc = (byte(j + 4) & 0xFu) | ((byte(j - 4) >> 6) << 4); mn = (byte(j + 4) >> 4) | ((byte(j) >> 6) << 4); }
++            const float a = h2f(hd[r].x) * (float) sc, b = h2f(hd[r].x >> 16) * (float) mn;   // ggml: d1 = d * sc, m1 = min * m
++            float q[8];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                q[i] = magic_minus((qq[r].x >> (8 * i + sh)) & 0xFu, 8388608.0f);
++                q[4 + i] = magic_minus((qq[r].y >> (8 * i + sh)) & 0xFu, 8388608.0f);
++            }
++#pragma unroll
++            for (int t = 0; t < TT; ++t) {
++                float dq = q[0] * x[t][0];
++#pragma unroll
++                for (int i = 1; i < 8; ++i) dq = fmaf(q[i], x[t][i], dq);
++                p[r][t] = fmaf(a, dq, -b * sx[t]);
++            }
++        }
++    }
++#pragma unroll
++    for (int t = 0; t < TT; ++t) {
++        float v[8];
++#pragma unroll
++        for (int r = 0; r < 8; ++r) v[r] = p[r][t];
++        const float sum = warp_sum8_rows(v, lane);
++        const int row = grp * 8 + ((lane >> 2) & 7);
++        if ((lane & 3) == 0 && row < ROWS) part[((size_t) s * PART_T + t0 + t) * ROWS + row] = sum;
++    }
++}
++// the 40 partial sums of every (token, row) in a fixed order: lo = silu(sum / hc), inject_out = sum
++__global__ void __launch_bounds__(128) reduce_kernel(GrMulti m, const float* __restrict__ part) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= m.T * ROWS) return;
++    const int t = i / ROWS, row = i - t * ROWS;
++    if (row >= LR && m.a[0].nq_inject == nullptr) return;
++    float v[NS];
++#pragma unroll
++    for (int k = 0; k < NS; ++k) v[k] = part[((size_t) k * PART_T + t) * ROWS + row];
++    float s = 0.0f;
++#pragma unroll
++    for (int k = 0; k < NS; ++k) s += v[k];
++    if (row < LR) {
++        const float x = s / (float) HC;
++        m.a[t].lo[row] = x / (1.0f + __expf(-x));
++    } else m.a[t].inject_out[row - LR] = s;
++}
++// Up: a warp = 8 rows (stream c = r >> 1, column d0 + (r & 1)), a block = 8 warps = 16 columns.  Row layout (320 B):
++// lane l's u32 pair at 8 l (5-bit codes of element l of blocks 0..5 | 6..9), the 10 f32 block scales at 256.
++template <int TT>
++__global__ void __launch_bounds__(256) up_kernel(GrMulti m, int t0) {
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int d0 = blockIdx.x * 16 + 2 * warp;
++    const uint8_t* W = m.a[0].nq_up;
++    uint2 code[8];
++#pragma unroll
++    for (int r = 0; r < 8; ++r)
++        code[r] = __ldg(reinterpret_cast<const uint2*>(W + (size_t) ((r >> 1) * N + d0 + (r & 1)) * kHcNqQ5Row) + lane);
++    float lo[TT][10];
++#pragma unroll
++    for (int t = 0; t < TT; ++t)
++#pragma unroll
++        for (int i = 0; i < 10; ++i) lo[t][i] = m.a[t0 + t].lo[32 * i + lane];
++    float p[8][TT];
++#pragma unroll
++    for (int r = 0; r < 8; ++r) {
++        const float4* sc4 = reinterpret_cast<const float4*>(W + (size_t) ((r >> 1) * N + d0 + (r & 1)) * kHcNqQ5Row + 256);
++        const float4 sA = __ldg(sc4), sB = __ldg(sc4 + 1);
++        const float2 sC = __ldg(reinterpret_cast<const float2*>(sc4 + 2));
++        const float d[10] = {sA.x, sA.y, sA.z, sA.w, sB.x, sB.y, sB.z, sB.w, sC.x, sC.y};
++        float dq[10];
++#pragma unroll
++        for (int i = 0; i < 10; ++i) {
++            const uint32_t w = i < 6 ? code[r].x : code[r].y, sh = 5 * (i < 6 ? i : i - 6);
++            dq[i] = d[i] * magic_minus((w >> sh) & 31u, 8388624.0f);   // ggml: (q - 16) * d
++        }
++#pragma unroll
++        for (int t = 0; t < TT; ++t) {
++            float acc = dq[0] * lo[t][0];
++#pragma unroll
++            for (int i = 1; i < 10; ++i) acc = fmaf(dq[i], lo[t][i], acc);
++            p[r][t] = acc;
++        }
++    }
++    const int rr = (lane >> 2) & 7, c = rr >> 1, dcol = d0 + (rr & 1), row = c * N + dcol;
++#pragma unroll
++    for (int t = 0; t < TT; ++t) {
++        float v[8];
++#pragma unroll
++        for (int r = 0; r < 8; ++r) v[r] = p[r][t];
++        const float dot = warp_sum8_rows(v, lane);
++        float g = 0.0f;
++        if ((lane & 3) == 0) {
++            const FusedGrArgs& a = m.a[t0 + t];
++            float rv = a.R[row];
++            if (a.apply) {
++                rv = fmaf(a.bo_prev[dcol], 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC), rv);
++                a.R_out[row] = rv;
++            }
++            const float xx = rv * a.w_norm[row] * a.rs[c];
++            g = xx * sigmoidf_(dot);
++        }
++        const float g0 = __shfl_sync(0xffffffffu, g, (lane & 4)), g1 = __shfl_sync(0xffffffffu, g, (lane & 4) + 8),
++                    g2 = __shfl_sync(0xffffffffu, g, (lane & 4) + 16), g3 = __shfl_sync(0xffffffffu, g, (lane & 4) + 24);
++        if (lane == 0 || lane == 4) {
++            float sum = 0.0f;
++            sum += g0; sum += g1; sum += g2; sum += g3;
++            m.a[t0 + t].mixed[d0 + (lane >> 2)] = sum / (float) HC;
++        }
++    }
++}
++float* g_part[64] = {};   // per device: NS x PART_T x ROWS partial sums (made by fused_gr_check, before any capture)
++float* part_of_current() {
++    int dev = 0;
++    return cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64 ? g_part[dev] : nullptr;
++}
++void prepare_current() {
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64 || g_part[dev] != nullptr) return;
++    void* p = nullptr;
++    if (cudaMalloc(&p, (size_t) NS * PART_T * ROWS * sizeof(float)) == cudaSuccess) g_part[dev] = (float*) p;
++    else cudaGetLastError();
++}
++template <int FMT>
++void launch_down(const GrMulti& m, int t0, int tt, float* part, cudaStream_t st) {
++    const dim3 grid(NS, (GROUPS + 7) / 8);
++    switch (tt) {
++        case 1: down_kernel<FMT, 1><<<grid, 256, 0, st>>>(m, t0, part); break;
++        case 2: down_kernel<FMT, 2><<<grid, 256, 0, st>>>(m, t0, part); break;
++        case 3: down_kernel<FMT, 3><<<grid, 256, 0, st>>>(m, t0, part); break;
++        default: down_kernel<FMT, 4><<<grid, 256, 0, st>>>(m, t0, part); break;
++    }
++}
++void launch_up(const GrMulti& m, int t0, int tt, cudaStream_t st) {
++    switch (tt) {
++        case 1: up_kernel<1><<<N / 16, 256, 0, st>>>(m, t0); break;
++        case 2: up_kernel<2><<<N / 16, 256, 0, st>>>(m, t0); break;
++        case 3: up_kernel<3><<<N / 16, 256, 0, st>>>(m, t0); break;
++        default: up_kernel<4><<<N / 16, 256, 0, st>>>(m, t0); break;
++    }
++}
++// the read: norm, down (token groups of at most 4), the fixed-order reduction, up (token groups of at most 4)
++bool launch(const GrMulti& m, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
++    float* part = part_of_current();
++    if (part == nullptr) return false;
++    const int T = m.T;
++    gr_norm_split_kernel<<<dim3(T, HC), THREADS, 0, st>>>(m);
++    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
++    for (int t0 = 0; t0 < T; t0 += 4) {
++        const int tt = T - t0 < 4 ? T - t0 : 4;
++        if (m.a[0].nq_down_fmt == 1) launch_down<1>(m, t0, tt, part, st);
++        else launch_down<0>(m, t0, tt, part, st);
++    }
++    reduce_kernel<<<(T * ROWS + 127) / 128, 128, 0, st>>>(m, part);
++    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
++    for (int t0 = 0; t0 < T; t0 += 4) launch_up(m, t0, T - t0 < 4 ? T - t0 : 4, st);
++    return true;
++}
++}  // namespace hcnq
++
+ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
+                                       unsigned long long* stamp_buf, int stamp_i0) {
+     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
+@@ -2855,6 +3094,17 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
+     m.xn = xn_scratch;
+     m.T = n_tok;
+     cudaStream_t st = (cudaStream_t) stream;
++    // STRATA_HC_NATIVE: the checkpoint's blocks (never with the STRATA_QFUSE q8_1 images: those are the BF16 reads')
++    if (!q8 && a[0].nq_down != nullptr && a[0].nq_up != nullptr && (a[0].w_inject == nullptr || a[0].nq_inject != nullptr)) {
++        if (hcnq::launch(m, st, stamp_buf, stamp_i0)) {
++            const cudaError_t en = cudaGetLastError();
++            if (en != cudaSuccess) {
++                std::fprintf(stderr, "fused_gr_read_multi native: %s\n", cudaGetErrorString(en));
++                std::exit(1);
++            }
++            return false;
++        }
++    }
+     if (a[0].q8_down != nullptr && a[0].q8_up != nullptr) {   // inject: Q8_0 copy, or the BF16 rows
+         launch_q8(m, xn_scratch, st, stamp_buf, stamp_i0);   // S23 experiment: STRATA_HC_Q8=1
+         const cudaError_t eq = cudaGetLastError();
+@@ -3270,6 +3520,7 @@ int fused_gr_variant() {
+ }
+ 
+ void fused_gr_check() {
++    hcnq::prepare_current();   // STRATA_HC_NATIVE scratch: here, before any graph capture
+     int dev = 0;
+     cudaGetDevice(&dev);
+     (void) gr_v3_default_on(dev);   // decided here, before any graph capture asks
+@@ -3816,3 +4067,45 @@ bool fused_gr_read_persist(const FusedGrArgs*, int, void*) { return false; }
+ 
+ 
+ 
++
++namespace strata::kernels {
++bool hc_native_ready() { return hcnq::part_of_current() != nullptr; }
++void hc_native_repack_q6k(const uint8_t* src, uint8_t* dst, int64_t n_blocks) {
++    for (int64_t b = 0; b < n_blocks; ++b) {
++        const uint8_t* s = src + b * 210;
++        uint8_t* o = dst + b * kHcNqQ6kBlock;
++        std::memcpy(o, s, 208);
++        uint16_t h;
++        std::memcpy(&h, s + 208, 2);
++        const float d = __half2float(__ushort_as_half(h));
++        std::memcpy(o + 208, &d, 4);
++        std::memset(o + 212, 0, kHcNqQ6kBlock - 212);
++    }
++}
++void hc_native_repack_q5_0_rows(const uint8_t* src, uint8_t* dst, int64_t rows) {
++    for (int64_t r = 0; r < rows; ++r) {
++        uint8_t* o = dst + r * kHcNqQ5Row;
++        std::memset(o, 0, kHcNqQ5Row);
++        uint32_t lo32[32] = {0}, hi32[32] = {0};
++        for (int k = 0; k < 10; ++k) {
++            const uint8_t* b = src + (r * 10 + k) * 22;
++            uint16_t h;
++            std::memcpy(&h, b, 2);
++            const float d = __half2float(__ushort_as_half(h));
++            std::memcpy(o + 256 + 4 * k, &d, 4);
++            uint32_t qh;
++            std::memcpy(&qh, b + 2, 4);
++            for (int l = 0; l < 32; ++l) {   // ggml: value j (< 16) = qs[j] & 15 | bit j of qh; value j + 16 = qs[j] >> 4 | bit j + 16
++                const int j = l & 15;
++                const uint32_t q = (l < 16 ? (b[6 + j] & 0xFu) : (uint32_t) (b[6 + j] >> 4)) | (((qh >> l) & 1u) << 4);
++                if (k < 6) lo32[l] |= q << (5 * k);
++                else hi32[l] |= q << (5 * (k - 6));
++            }
++        }
++        for (int l = 0; l < 32; ++l) {
++            std::memcpy(o + 8 * l, &lo32[l], 4);
++            std::memcpy(o + 8 * l + 4, &hi32[l], 4);
++        }
++    }
++}
++}  // namespace strata::kernels

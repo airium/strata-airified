@@ -1,0 +1,31 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 1fba9061..5cb9405d 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -7522,6 +7522,15 @@ int main(int argc, char** argv) {
+     }
+     strata::core::ArenaExpertSource arena_src;
+     strata::core::ExpertSource* srcp = nullptr;
++    // The arena must know row ownership before any pages are CUDA-registered.
++    // Keep the legacy constructor timing unless four-node placement was explicitly requested.
++    std::optional<strata::kernels::cpu::ExpertPool> planned_pool;
++#if defined(__linux__)
++    if (const char* split=std::getenv("STRATA_NUMA_SPLIT"); split && std::strcmp(split,"4")==0) {
++        if (o.pool_measure) { std::fprintf(stderr,"strata: four-node placement requires fixed pool affinity, not --pool-affinity measure\n"); return 1; }
++        planned_pool.emplace(o.pool_workers,true,!o.no_host_worker,o.pool_affinity,o.pool_tasks);
++    }
++#endif
+     // #4846 (owner 11-01): the arena first, and when the RAM is still short after the wait and the give-back, the --mmap-experts source
+     // for this run (o.mmap_experts is set here, before anything below sizes the experts' tier from it; nothing was sized for the arena
+     // by now: the PLE table's lock, priced against it, was just given back).  A hand-set `--ple-io ram` and a shared arena file are kept
+@@ -7878,8 +7887,8 @@ int main(int argc, char** argv) {
+ #endif
+     if (o.pool_measure)
+         o.pool_affinity = measure_pool_affinity(srcp, o.pool_workers, !o.no_host_worker, o.pool_tasks);
+-    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker,
+-                                        o.pool_affinity, o.pool_tasks);
++    if (!planned_pool) planned_pool.emplace(o.pool_workers, true, !o.no_host_worker, o.pool_affinity, o.pool_tasks);
++    strata::kernels::cpu::ExpertPool& pool = *planned_pool;
+     std::fprintf(stderr, "strata generate: CPU pool tasks/phase: %d%s, participating threads: %d\n",
+                  o.pool_tasks ? o.pool_tasks : 3 * (pool.workers() + (pool.host_works() ? 1 : 0)),
+                  o.pool_tasks ? " (capped by rows)" : " (automatic)",

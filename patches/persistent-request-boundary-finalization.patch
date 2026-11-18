@@ -1,0 +1,46 @@
+diff --git a/serve/server.py b/serve/server.py
+index 6f7dd63b..91e4c4c6 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -2768,16 +2768,26 @@ class StrataEngine:
+             return
+         with self.persistent_lock:
+             cache.before(self,ids,sampling or {},embeddings)
+-            output=[];completed=False
++            output=[];completed=False;failed=False;before=self.last
+             stream=self._generate_tokens(ids,max_new,sampling,cancel,embeddings,prefill_only)
+             try:
+                 for token in stream:
+                     if token is not None:output.append(token)
+                     yield token
+                 completed=True
++            except GeneratorExit:
++                raise  # the HTTP frontend closes at EOS; close() below first drains native DONE
++            except BaseException:
++                failed=True
++                raise
+             finally:
+                 stream.close()
+-            if completed:cache.after(self,ids,output,sampling or {},cancel,embeddings)
++                settled = (self.last is not before and self.last.get('finish') in ('stop','length')
++                           and int(self.last.get('generated',0)) <= len(output))
++                if not failed and (completed or settled):
++                    cache.after(self,ids,output,sampling or {},cancel,embeddings)
++                else:
++                    cache.live=[]
+ 
+     def _generate_tokens(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
+         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
+@@ -3037,7 +3047,11 @@ class StrataEngine:
+     def session_file(self, action: str, path: str) -> dict:
+         with getattr(self, 'persistent_lock', contextlib.nullcontext()):
+             with self._exclusive_control():
+-                return self._session_file(action, path)
++                result = self._session_file(action, path)
++                cache = getattr(self, 'persistent_cache', None)
++                if action == 'restore' and cache is not None:
++                    cache.live=[]  # a manual restore also replaces the state behind the live hint
++                return result
+ 
+     def _session_file(self, action: str, path: str) -> dict:
+         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).

@@ -1,0 +1,36 @@
+diff --git a/src/core/dflash2_ring_test.cpp b/src/core/dflash2_ring_test.cpp
+index d01fa217..d4791865 100644
+--- a/src/core/dflash2_ring_test.cpp
++++ b/src/core/dflash2_ring_test.cpp
+@@ -185,6 +185,31 @@ int main(int argc, char** argv) {
+         check(bad == 0, "the old branch's rows are bitwise the original update's, not the new branch's");
+         check(!cold, "not cold");
+     }
++    {   // ---- 6 restart: no device addresses or live ring survive the drafter object
++        std::printf("6 restart-persistent lineage\n");
++        std::vector<uint8_t> saved;
++        {
++            Dflash2Drafter source;
++            if (!fresh(source) || !feed(source,dev,1,0,P,err)) return 2;
++            check(source.save_session_state(saved,err), "persistent log serializes at a safe boundary");
++            check(saved.size() <= source.session_state_limit(N), "serialized extent respects runtime bounds");
++        }
++        Dflash2Drafter restored;
++        if (!fresh(restored)) return 2;
++        auto broken=saved; broken.pop_back();
++        check(!restored.prepare_session_restore(broken,N,err), "truncated lineage is rejected before changing the live ring");
++        check(!restored.prepare_session_restore(saved,128,err), "oversized history is refused before allocation");
++        check(restored.prepare_session_restore(saved,N,err), "fresh drafter validates complete persistent lineage");
++        restored.commit_session_restore();
++        const auto ids=ids_of(1,N);
++        bool cold=true;
++        restored.begin_request(ids.data(),N,P,&cold);
++        int wrong_tag=0;
++        const int bad=count_bad(restored,ref,N-2047,P,&wrong_tag);
++        check(bad==0 && wrong_tag==0, "restart rebuild matches uninterrupted K and V bytes in every layer/head/slot");
++        check(!cold && restored.last_rebuilt==P-(N-2047), "fresh ring rebuilt the whole required window without missing rows");
++        if (!feed(restored,dev,1,P,N,err)) return 2;
++    }
+     {   // ---- 5 evicted
+         std::printf("5 evicted (stash budget 0)\n");
+         setenv("STRATA_DF2_LOG_MIB", "0", 1);

@@ -1,0 +1,221 @@
+diff --git a/include/strata/core/native_dense.hpp b/include/strata/core/native_dense.hpp
+index 10a5082b7..17259a757 100644
+--- a/include/strata/core/native_dense.hpp
++++ b/include/strata/core/native_dense.hpp
+@@ -46,6 +46,10 @@ public:
+     /// BF16).  Reads the tensor directories only.  generate.cpp turns STRATA_HC_Q8 on by default on CUDA when this is true (owner yes 2026-11-07).
+     static bool gguf_carries_q8_hc(const std::vector<std::string>& shards);
+     static bool hc_q8_requested();
++    /// STRATA_HC_NATIVE=1 with STRATA_HC_NATIVE_NO_BF16=1: the layers' hyper-connection down / up projections whose GGUF
++    /// encoding the native read serves (Q4_K / Q6_K down, Q5_0 rows of 320 up) are not loaded as BF16.
++    static bool hc_native_no_bf16_requested();
++    static bool add_hc_native_skip(const std::vector<std::string>& shards, std::set<std::string>& skip, std::string& err);
+     static bool add_hc_skip(const std::string& pack_dir, std::set<std::string>& skip);
+     /// A projection's bf16 values for a path that has no Q8 kernel (the prompt path's GEMMs, the single-token read): the
+     /// resident copy, or - when the row was skipped - the Q8_0 copy dequantized into a per-stream scratch (`slot` 0 / 1:
+diff --git a/include/strata/kernels/fused_gr.hpp b/include/strata/kernels/fused_gr.hpp
+index 1b6b7d8f9..4d276eed7 100644
+--- a/include/strata/kernels/fused_gr.hpp
++++ b/include/strata/kernels/fused_gr.hpp
+@@ -66,6 +66,9 @@ void hc_native_repack_q6k(const uint8_t* src, uint8_t* dst, int64_t n_blocks);
+ void hc_native_repack_q5_0_rows(const uint8_t* src, uint8_t* dst, int64_t rows);   ///< rows of 320 values (10 blocks)
+ /// The native read is ready on the current card (its scratch exists; fused_gr_check makes it).
+ bool hc_native_ready();
++/// STRATA_HC_NATIVE_NO_BF16: the BF16 matrix (ggml / gguf-py dequantization order, then round-to-nearest-even: the
++/// pack's bytes exactly) of a native copy (`fmt` as WeightRef::hc_nq_fmt), `rows` x `cols` (cols the contiguous axis).
++void hc_native_dequant_bf16(const uint8_t* src, int fmt, int64_t rows, int64_t cols, uint16_t* dst, void* stream);
+ 
+ bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
+ /// STRATA_HC_Q8: n int8 codes with one fp32 scale per 32 -> bf16 (the prompt path's GEMMs take bf16).
+diff --git a/src/core/native_dense.cpp b/src/core/native_dense.cpp
+index 2cb1e75cb..c8c35ec6b 100644
+--- a/src/core/native_dense.cpp
++++ b/src/core/native_dense.cpp
+@@ -561,10 +561,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+                 err = "native dense (STRATA_HC_Q8): quantizing the projections failed"; return false;
+             }
+         }
+-        if (hc_q8_env()) {   // the scratches of hc_bf16_view (rows without a bf16 copy), here and not on first use
++        if (hc_q8_env() || hc_nq_count != 0) {   // the scratches of hc_bf16_view (rows without a bf16 copy), here and not on first use
+             uint64_t elems = 0;
+             for (const auto& [name, ref] : table.table_)
+-                if (ref.hc_q8 != nullptr && ref.data == nullptr) elems = (std::max)(elems, (uint64_t) ref.elements);
++                if ((ref.hc_q8 != nullptr || ref.hc_nq != nullptr) && ref.data == nullptr) elems = (std::max)(elems, (uint64_t) ref.elements);
+             int dev = 0;
+             if (elems != 0 && cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64 && g_hc_scratch[dev][0][0] == nullptr) {
+                 for (int c = 0; c < 2; ++c)
+@@ -580,6 +580,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+                     }
+             }
+         }
++        if (hc_native_no_bf16_requested())
++            for (const auto& [name, ref] : table.table_)
++                if (name.rfind("blk.", 0) == 0 && hc_q8_name(name) && (name.ends_with("_down.weight") || name.ends_with("_up.weight")) &&
++                    ref.data == nullptr && ref.hc_q8 == nullptr && ref.hc_nq == nullptr && in_range(name) && !outside(name) && ref.resident == false) {
++                    err = "native dense (STRATA_HC_NATIVE_NO_BF16): " + name + " has neither BF16 rows nor a native copy"; return false;
++                }
+         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
+         void* allocation = nullptr;
+         const auto status = cudaMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in));
+@@ -636,6 +642,30 @@ bool NativeDense::gguf_carries_q8_hc(const std::vector<std::string>& shards) {
+ 
+ bool NativeDense::hc_q8_requested() { return hc_q8_env(); }
+ 
++bool NativeDense::hc_native_no_bf16_requested() {
++    static const bool on = [] {
++        const char* a = std::getenv("STRATA_HC_NATIVE"), *b = std::getenv("STRATA_HC_NATIVE_NO_BF16");
++        return a != nullptr && a[0] == '1' && b != nullptr && b[0] == '1';
++    }();
++    return on;
++}
++
++bool NativeDense::add_hc_native_skip(const std::vector<std::string>& shards, std::set<std::string>& skip, std::string& err) {
++    try {
++        for (const auto& path : shards) {
++            const strata::GgufFile g(path);
++            for (const auto& t : g.tensors()) {
++                const std::string& n = t.name;
++                if (n.rfind("blk.", 0) != 0 || !hc_q8_name(n) || t.shape.size() != 2) continue;
++                const bool down = n.ends_with("_down.weight"), up = n.ends_with("_up.weight");
++                if ((down && (t.type == 12 || t.type == 14) && t.shape[0] % 256 == 0) || (up && t.type == 6 && t.shape[0] == 320))
++                    skip.insert(n);
++            }
++        }
++    } catch (const std::exception& e) { err = std::string("native dense (STRATA_HC_NATIVE_NO_BF16): ") + e.what(); return false; }
++    return true;
++}
++
+ bool NativeDense::add_hc_skip(const std::string& pack_dir, std::set<std::string>& skip) {
+     std::FILE* f = std::fopen((pack_dir + "/index.txt").c_str(), "rb");
+     if (!f) return false;
+@@ -651,7 +681,7 @@ bool NativeDense::add_hc_skip(const std::string& pack_dir, std::set<std::string>
+ 
+ const uint16_t* NativeDense::hc_bf16_view(const WeightRef& w, void* stream, int slot, int cls) {
+     if (w.data != nullptr) return (const uint16_t*) w.data;
+-    if (w.hc_q8 == nullptr) return nullptr;
++    if (w.hc_q8 == nullptr && w.hc_nq == nullptr) return nullptr;
+     // the device's scratch (allocated at load, one pair per device): the prompt path and the single-token read run one
+     // after the other on a device, and each use is stream-ordered after the previous GEMM that read the slot
+     int dev = 0;
+@@ -660,7 +690,8 @@ const uint16_t* NativeDense::hc_bf16_view(const WeightRef& w, void* stream, int
+     if (buf == nullptr) return nullptr;
+     // the prompt path: the scratch may still be read by a GEMM another stream enqueued (batch serving: several slots' prompts)
+     if (cls == 0 && g_hc_ev_set[dev][slot]) cudaStreamWaitEvent((cudaStream_t) stream, g_hc_ev[dev][slot], 0);
+-    strata::kernels::fused_gr_dequant_q8_0((const uint8_t*) w.hc_q8, (uint16_t*) buf, w.elements / 32, stream);
++    if (w.hc_q8 != nullptr) strata::kernels::fused_gr_dequant_q8_0((const uint8_t*) w.hc_q8, (uint16_t*) buf, w.elements / 32, stream);
++    else strata::kernels::hc_native_dequant_bf16((const uint8_t*) w.hc_nq, w.hc_nq_fmt, w.ne1, w.ne0, (uint16_t*) buf, stream);   // STRATA_HC_NATIVE_NO_BF16
+     return (const uint16_t*) buf;
+ }
+ 
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index 064fd25fe..8dc3c0b1c 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -15,6 +15,7 @@
+ #include "s26_tsum.cuh"
+ 
+ #include <cuda_fp16.h>
++#include <cuda_bf16.h>
+ #include <cuda_runtime.h>
+ 
+ #include <atomic>
+@@ -3072,7 +3073,7 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
+     for (int t = 0; t < n_tok; ++t) {
+         m.a[t] = a[t];
+         const FusedGrArgs& x = a[t];
+-        if (!x.R || !x.w_norm || !((x.w_down && x.w_up) || (x.q8_down && x.q8_up)) || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
++        if (!x.R || !x.w_norm || !((x.w_down && x.w_up) || (x.q8_down && x.q8_up) || (x.nq_down && x.nq_up)) || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
+             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
+             x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm || x.q8_down != a[0].q8_down ||
+             x.q8_up != a[0].q8_up || x.q8_inject != a[0].q8_inject) {
+@@ -4070,6 +4071,50 @@ bool fused_gr_read_persist(const FusedGrArgs*, int, void*) { return false; }
+ 
+ namespace strata::kernels {
+ bool hc_native_ready() { return hcnq::part_of_current() != nullptr; }
++namespace {
++__device__ __forceinline__ uint16_t bf16_rne(float v) { return __bfloat16_as_ushort(__float2bfloat16_rn(v)); }
++__global__ void hcnq_dequant_kernel(const uint8_t* __restrict__ src, int fmt, int64_t rows, int64_t cols, uint16_t* __restrict__ dst) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= rows * cols) return;
++    const int64_t r = i / cols, k = i - r * cols;
++    float y;
++    if (fmt == 2) {   // Q5_0 lane-major row (320 B): element k = lane k % 32 of block k / 32
++        const uint8_t* row = src + r * kHcNqQ5Row;
++        const int b = (int) (k >> 5), l = (int) (k & 31);
++        const uint32_t w = *reinterpret_cast<const uint32_t*>(row + 8 * l + (b < 6 ? 0 : 4));
++        const int q = (int) ((w >> (5 * (b < 6 ? b : b - 6))) & 31u) - 16;
++        const float d = *reinterpret_cast<const float*>(row + 256 + 4 * b);
++        y = __fmul_rn(d, (float) q);                                          // gguf-py: d * (q - 16)
++    } else {
++        const int64_t sb = k >> 8;
++        const int e = (int) (k & 255);
++        if (fmt == 0) {   // Q4_K, 144-byte superblocks as stored
++            const uint8_t* blk = src + (r * (cols >> 8) + sb) * 144;
++            const float d = __half2float(*reinterpret_cast<const __half*>(blk)), dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
++            const uint8_t* s = blk + 4;
++            const int j = e >> 5, l = e & 31;
++            int sc, m;
++            if (j < 4) { sc = s[j] & 63; m = s[j + 4] & 63; }
++            else { sc = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4); m = (s[j + 4] >> 4) | ((s[j] >> 6) << 4); }
++            const int q = (blk[16 + 32 * (j >> 1) + l] >> (4 * (j & 1))) & 0xF;
++            y = __fsub_rn(__fmul_rn(__fmul_rn(d, (float) sc), (float) q), __fmul_rn(dmin, (float) m));   // gguf-py: (d*sc)*q - dmin*m
++        } else {          // Q6_K, 224-byte superblocks (f32 d at 208)
++            const uint8_t* blk = src + (r * (cols >> 8) + sb) * kHcNqQ6kBlock;
++            const int n = e >> 7, rem = e & 127, jl = rem >> 5, l = rem & 31;
++            const int ql = (blk[n * 64 + 32 * (jl & 1) + l] >> (4 * (jl >> 1))) & 0xF;
++            const int qh = (blk[128 + n * 32 + l] >> (2 * jl)) & 3;
++            const float d = *reinterpret_cast<const float*>(blk + 208);
++            const int8_t sc = (int8_t) blk[192 + (e >> 4)];
++            y = __fmul_rn(__fmul_rn(d, (float) sc), (float) ((ql | (qh << 4)) - 32));   // gguf-py: (d*sc) * (q - 32)
++        }
++    }
++    dst[i] = bf16_rne(y);
++}
++}  // namespace
++void hc_native_dequant_bf16(const uint8_t* src, int fmt, int64_t rows, int64_t cols, uint16_t* dst, void* stream) {
++    const int64_t n = rows * cols;
++    hcnq_dequant_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(src, fmt, rows, cols, dst);
++}
+ void hc_native_repack_q6k(const uint8_t* src, uint8_t* dst, int64_t n_blocks) {
+     for (int64_t b = 0; b < n_blocks; ++b) {
+         const uint8_t* s = src + b * 210;
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 39bb78426..1bb23bb8a 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -4150,7 +4150,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                 if (!wn || !wd || !wu || !wi) return false;
+                 // STRATA_HC_Q8 without a bf16 copy: this path's GEMMs read bf16, so the matrices are dequantized per half
+                 core::WeightRef wd_q8, wu_q8;
+-                if (!wd->data && wd->hc_q8 && !wu->data && wu->hc_q8) {
++                if (!wd->data && (wd->hc_q8 || wd->hc_nq) && !wu->data && (wu->hc_q8 || wu->hc_nq)) {
+                     wd_q8 = *wd; wu_q8 = *wu;
+                     wd_q8.data = core::NativeDense::hc_bf16_view(*wd, m.cs, 0, 0);
+                     wu_q8.data = core::NativeDense::hc_bf16_view(*wu, m.cs, 1, 0);
+@@ -7603,7 +7603,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+                     // STRATA_HC_Q8 without a bf16 copy (0.2.2's run_impl): this path's GEMMs read bf16, so the matrices
+                     // are dequantized per half
+                     core::WeightRef wd_q8, wu_q8;
+-                    if (!wd->data && wd->hc_q8 && !wu->data && wu->hc_q8) {
++                    if (!wd->data && (wd->hc_q8 || wd->hc_nq) && !wu->data && (wu->hc_q8 || wu->hc_nq)) {
+                         wd_q8 = *wd; wu_q8 = *wu;
+                         wd_q8.data = core::NativeDense::hc_bf16_view(*wd, cs, 0, 0);
+                         wu_q8.data = core::NativeDense::hc_bf16_view(*wu, cs, 1, 0);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 0e4cd4bb4..dd279d017 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -5057,6 +5057,13 @@ int main(int argc, char** argv) {
+         // quantizes them from the pack file), so their bf16 copy is not loaded
+         if (!o.native_dense_gguf.empty() && !multi_gpu && strata::core::NativeDense::hc_q8_requested())
+             strata::core::NativeDense::add_hc_skip(o.pack, skip);
++        // STRATA_HC_NATIVE_NO_BF16=1 (with STRATA_HC_NATIVE=1): the native copies serve the verify read, the other paths
++        // rebuild BF16 on demand (hc_bf16_view), so the BF16 rows are not loaded - VRAM for the expert cache
++        if (!o.native_dense_gguf.empty() && strata::core::NativeDense::hc_native_no_bf16_requested() &&
++            !strata::core::NativeDense::add_hc_native_skip(o.native_dense_gguf, skip, err)) {
++            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
++            return 1;
++        }
+     }
+     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
+     // Without this each card keeps a full copy (~3.4 GB for the Coder) that its stage never reads - VRAM the

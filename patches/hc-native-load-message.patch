@@ -1,0 +1,21 @@
+diff --git a/src/core/native_dense.cpp b/src/core/native_dense.cpp
+index c8c35ec6b..20df845bc 100644
+--- a/src/core/native_dense.cpp
++++ b/src/core/native_dense.cpp
+@@ -617,9 +617,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+         allocated_ = allocated;
+         if (hc_q8_skipped != 0 && strata::core::manifest::enabled())   // STRATA_MANIFEST: what the stage filter did not copy
+             strata::core::manifest::instance().tensors("dense_hc_q8_out_of_stage_not_copied", "Q8_0", hc_q8_skipped, hc_q8_skipped_bytes);
+-        if (hc_nq_count != 0)
+-            std::fprintf(stderr, "strata: STRATA_HC_NATIVE=1: %llu hyper-connection projections read natively (%.1f MiB, BF16 rows kept)\n",
+-                         (unsigned long long) hc_nq_count, (double) hc_nq_bytes / 1048576.0);
++        if (hc_nq_count != 0) {
++            uint64_t without_bf16 = 0;   // STRATA_HC_NATIVE_NO_BF16: the skipped BF16 rows of this stage
++            for (const auto& [name, ref] : table.table_)
++                if (ref.hc_nq != nullptr && ref.data == nullptr) ++without_bf16;
++            std::fprintf(stderr, "strata: STRATA_HC_NATIVE=1: %llu hyper-connection projections read natively (%.1f MiB); %llu without BF16 rows\n",
++                         (unsigned long long) hc_nq_count, (double) hc_nq_bytes / 1048576.0, (unsigned long long) without_bf16);
++        }
+         if (hc_q8_env())
+             std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",
+                          (double) hc_q8_bytes / 1073741824.0);

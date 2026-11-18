@@ -1,0 +1,46 @@
+diff --git a/src/prefill/gemm.cu b/src/prefill/gemm.cu
+index 8f05b3c7..01606188 100644
+--- a/src/prefill/gemm.cu
++++ b/src/prefill/gemm.cu
+@@ -1,5 +1,6 @@
+ // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
+ #include "strata/prefill/gemm.hpp"
++#include "strata/core/geometry.hpp"
+ #include "strata/kernels/dequant_bf16.hpp"
+ #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+ #include "strata/prefill/mmq_ids_margin.hpp"
+@@ -862,6 +863,25 @@ int bf16_path() {
+     if (forced >= 0) return forced != 0 ? 1 : 0;
+     return cc < 75 ? 1 : 0;
+ }
++// Optional operator isolation: keep routing/indexer and other projections on
++// their original BF16 arithmetic while evaluating only hyperconnection GEMMs.
++int bf16_path_for_shape(int64_t N, int64_t K) {
++    const int path = bf16_path();
++    if (path != 1) return path;
++    static const int scope = [] {
++        const char* e = std::getenv("STRATA_BF16_TC_SCOPE");
++        if (e == nullptr || std::strcmp(e, "all") == 0) return 0;
++        if (std::strcmp(e, "hc") == 0) return 1;
++        if (std::strcmp(e, "up") == 0) return 2;
++        std::fprintf(stderr, "STRATA_BF16_TC_SCOPE: expected all, hc or up\n");
++        std::exit(1);
++    }();
++    if (scope == 0) return path;
++    const auto& g = strata::core::kCompiledGeometry;
++    const bool up = K == g.hc_lr && N == g.hc_dim();
++    const bool read = K == g.hc_dim() && (N == g.hc_lr || N == g.hc);
++    return (up || (scope == 1 && read)) ? path : 0;
++}
+ bool grow(uint16_t*& p, int64_t& have, int64_t want) {   // `have`, `want`: 2-byte elements
+     if (have >= want) return true;
+     if (p) cudaFree(p);
+@@ -1103,7 +1123,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
+ #else
+     constexpr bool kPascalPath = false;
+ #endif
+-    if (const int path = K > 0 ? bf16_path() : 0; (path == 1 && N > 1 && beta == 0.0f) || (path == 2 && kPascalPath)) {
++    if (const int path = K > 0 ? bf16_path_for_shape(N, K) : 0; (path == 1 && N > 1 && beta == 0.0f) || (path == 2 && kPascalPath)) {
+         // FP16 (path 1) or FP32 (path 2, Pascal) copies of the weight and of X, converted in tiles.  Issue #1757: when
+         // the buffers did not fit in the VRAM that was left (a stage of a layer split keeps ~100 MiB), this fell through
+         // to the raw BF16 cuBLAS call, which a Pascal card answers with CUBLAS_STATUS_INTERNAL_ERROR (14).  Now the

@@ -1,0 +1,41 @@
+diff --git a/src/prefill/gemm.cu b/src/prefill/gemm.cu
+index d285ff0f..c250e394 100644
+--- a/src/prefill/gemm.cu
++++ b/src/prefill/gemm.cu
+@@ -1128,7 +1128,21 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
+         const char* e = std::getenv("STRATA_BF16_F32");
+         return e != nullptr && e[0] == '1';
+     }();
+-    const bool turing_f32 = f32_requested && current_cc() == 75 && ldx == 0 && !x_f16;
++    static const int f32_scope = [] {
++        const char* e = std::getenv("STRATA_BF16_F32_SCOPE");
++        if (e == nullptr || std::strcmp(e, "all") == 0) return 0;
++        if (std::strcmp(e, "up") == 0) return 1;
++        if (std::strcmp(e, "fast") == 0) return 2;
++        std::fprintf(stderr, "STRATA_BF16_F32_SCOPE: expected all, up or fast\n");
++        std::exit(1);
++    }();
++    const auto& f32_geometry = strata::core::kCompiledGeometry;
++    const bool f32_shape = f32_scope == 0 ||
++        (f32_scope == 1 ? (K == f32_geometry.hc_lr && N == f32_geometry.hc_dim())
++                        : (N > 1 && (K <= f32_geometry.n_embd || N <= f32_geometry.hc)));
++    // The FP16-image fallback below recurses with its BF16 image in tc_x_.
++    // Reusing/growing that same scratch for FP32 would overwrite/free X.
++    const bool turing_f32 = f32_requested && f32_shape && current_cc() == 75 && ldx == 0 && !x_f16 && X != tc_x_;
+     if (const int path = K > 0 ? (turing_f32 ? 2 : bf16_path_for_shape(N, K)) : 0;
+         (path == 1 && N > 1 && beta == 0.0f) || (path == 2 && (kPascalPath || turing_f32))) {
+         // FP16 (path 1) or FP32 (path 2, Pascal) copies of the weight and of X, converted in tiles.  Issue #1757: when
+diff --git a/src/prefill/gemm_bf16_parity.cu b/src/prefill/gemm_bf16_parity.cu
+index c6e1658e..1442c739 100644
+--- a/src/prefill/gemm_bf16_parity.cu
++++ b/src/prefill/gemm_bf16_parity.cu
+@@ -71,6 +71,9 @@ int main(int argc, char** argv) {
+     const Shape shapes[] = {
+         {4096, 320, 10240, 0, "hc down (activations sliced)"},
+         {4096, 10240, 320, 0, "hc up"},
++        {512, 10240, 320, 0, "hc up short"},
++        {999, 10240, 320, 0, "hc up non-tile tail"},
++        {8192, 10240, 320, 0, "hc up full prompt chunk"},
+         {777, 2560, 2560, 0, "PLE value"},
+         {512, 512, 2560, 0, "router / indexer q"},
+         {300, 4, 10240, 0, "hc inject"},

@@ -1,0 +1,41 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 8fef2876..ca2548d9 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -15724,17 +15724,34 @@ int main(int argc, char** argv) {
+                         if (o.session_save_reclaim) strata::core::session_save_reclaim(
+                             checks, conversations, sl, floor, strata::core::available_host_bytes);
+                         const ConvCheckpoint* deepest = nullptr;
++                        uint64_t selected_bytes = 0;
++                        const bool save_all = [] {
++                            const char* value = std::getenv("STRATA_SESSION_ALL_CHECKPOINTS");
++                            return value != nullptr && std::atoi(value) != 0;
++                        }();
+                         for (const auto& c : checks) {
+                             if (c.stage_parts.size() != stages.size()) continue;
++                            if (save_all) {
++                                const uint64_t bytes = c.bytes();
++                                selected_bytes = selected_bytes > UINT64_MAX - bytes ? UINT64_MAX : selected_bytes + bytes;
++                            }
+                             if (!deepest || (c.pinned && !deepest->pinned) ||
+                                 (c.pinned == deepest->pinned && c.ids.size() > deepest->ids.size())) deepest = &c;
+                         }
+                         std::string why;
+-                        if (!admit(strata::core::session_save_peak_bytes(deepest, sl), why)) {
++                        uint64_t peak = strata::core::session_save_peak_bytes(deepest, sl);
++                        if (save_all && deepest && selected_bytes > deepest->bytes()) {
++                            const uint64_t extra = selected_bytes - deepest->bytes();
++                            peak = extra > (UINT64_MAX - peak) / 2 ? UINT64_MAX : peak + 2 * extra;
++                        }
++                        if (!admit(peak, why)) {
+                             refuse(why, strata::core::SessionError::memory); continue;
+                         }
+                         std::vector<ConvCheckpoint> chosen;
+-                        if (deepest) chosen.push_back(*deepest);
++                        if (save_all) {
++                            for (const auto& c : checks)
++                                if (c.stage_parts.size() == stages.size()) chosen.push_back(c);
++                        } else if (deepest) chosen.push_back(*deepest);
+                         kept = chosen.size();
+                         auto split = strata::core::conversation_checkpoints_split(std::move(chosen), stages.size());
+                         strata::core::SavedConversation meta;

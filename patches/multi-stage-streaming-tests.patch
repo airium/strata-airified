@@ -1,0 +1,42 @@
+diff --git a/src/core/conversation_file_test.cpp b/src/core/conversation_file_test.cpp
+index 851ffcc6..b7ddf925 100644
+--- a/src/core/conversation_file_test.cpp
++++ b/src/core/conversation_file_test.cpp
+@@ -294,6 +294,29 @@ int main() {
+         SavedConversation restored;
+         check(session_file_read(path.string(), id, restored, written, error, limits) && same(split, restored),
+               "v2 preserves stage KV/GDN/PLE/plans and draft bytes");
++        auto source_for = [](const SavedConversation& image) {
++            std::vector<SessionKvSource> sources;
++            for (const auto& k : image.kv) {
++                SessionKvSource s;
++                s.format=k.format; s.cells=k.cells; s.heads=k.heads; s.head_dim=k.head_dim;
++                s.page_size=k.page_size; s.pooled_rows=k.pooled_rows; s.idx_dim=k.idx_dim;
++                const std::array<const ConversationBuffer*,5> parts={&k.k,&k.v,&k.k_scale,&k.v_scale,&k.pooled};
++                for (size_t i=0;i<5;++i) s.sizes[i]=parts[i]->size();
++                s.read=[parts](size_t part,size_t offset,void* dst,size_t n) { return parts[part]->read(dst,offset,n); };
++                sources.push_back(std::move(s));
++            }
++            return sources;
++        };
++        auto meta=split; meta.kv.clear(); meta.stage_images[0].kv.clear();
++        auto root_sources=source_for(split);
++        std::vector<std::vector<SessionKvSource>> stage_sources{source_for(split.stage_images[0])};
++        const auto streamed=dir/"split-streamed.bin";
++        check(session_file_write(streamed.string(),meta,root_sources,stage_sources,id,written,error), "v2 streams both owning stages");
++        check(slurp(streamed)==slurp(path), "v2 streamed bytes equal captured bytes");
++        const auto old=slurp(streamed);
++        stage_sources[0][0].read=[](size_t,size_t,void*,size_t) { return false; };
++        check(!session_file_write(streamed.string(),meta,root_sources,stage_sources,id,written,error), "v2 later-stage transfer failure refuses publication");
++        check(slurp(streamed)==old && no_temp(dir), "v2 failure preserves previous generation with no temporary file");
+         check(rejects(path, id, "stage count"), "v2 refuses a split file in a single-stage runtime");
+         auto bad = limits; bad.stages[0].layer_range = std::make_pair(int64_t(23), int64_t(48));
+         check(rejects(path,id,"layer",bad), "v2 refuses another split boundary before stage allocation");
+@@ -408,6 +431,7 @@ int main() {
+         auto differs = [&](auto edit) { SessionConfig d = c; edit(d); return session_config_fingerprint(d) != base; };
+         check(differs([](SessionConfig& d) { d.engine_version = "0.1.39"; }), "engine version enters the config");
+         check(differs([](SessionConfig& d) { d.backend = "hip"; }), "backend enters the config");
++        check(differs([](SessionConfig& d) { d.runtime_key = "another-build-and-arithmetic"; }), "build/operator identity enters the config");
+         check(differs([](SessionConfig& d) { d.kv = "fp16"; }), "kv enters the config");
+         check(differs([](SessionConfig& d) { d.max_context = 65537; }), "max context enters the config");
+         check(differs([](SessionConfig& d) { d.kv_resident = 1; }), "kv residency enters the config");

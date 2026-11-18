@@ -1,0 +1,61 @@
+{
+  "url": "https://github.com/Niko1221/Strata.git",
+  "revision": "13eedf552417a6a791a7d13c6597e24300ee3a09",
+  "path": "vendor/strata",
+  "patches": [
+    "patches/q5_0-mmq-coverage.patch",
+    "patches/bf16-tc-direct-fp16-input.patch",
+    "patches/bf16-tc-operator-scope.patch",
+    "patches/q5_0-grouped-expert-coverage.patch",
+    "patches/bf16-fp32-sgemm-experiment.patch",
+    "patches/stable-cmake-overlay.patch",
+    "patches/bf16-fp32-scope-and-alias-guard.patch",
+    "patches/kquant-grouped-gu-two-rows.patch",
+    "patches/multi-stage-session-codec.patch",
+    "patches/nullable-stage-snapshot-and-dflash-log.patch",
+    "patches/multi-stage-native-session-runtime.patch",
+    "patches/layer-split-dflash-prompt-taps.patch",
+    "patches/automatic-persistent-prefix-cache.patch",
+    "patches/multi-stage-streaming-tests.patch",
+    "patches/dflash-persistent-ring-parity-test.patch",
+    "patches/persistent-metadata-eviction-guard.patch",
+    "patches/retain-periodic-prefix-checkpoints.patch",
+    "patches/persistent-request-boundary-finalization.patch",
+    "patches/bounded-image-wire-keys.patch",
+    "patches/nps4-expert-row-placement.patch",
+    "patches/cpu-expert-phase-diagnostics.patch",
+    "patches/plan-nps4-pool-before-arena.patch",
+    "patches/nps4-mapped-arena-guard-and-contracts.patch",
+    "patches/epyc-nps4-service-lifecycle.patch",
+    "patches/persistent-off-host-graph-launch.patch",
+    "patches/host-only-decode-profile.patch",
+    "patches/launch-worker-platform-guard.patch",
+    "patches/graph-submit-cpu-diagnostics.patch",
+    "patches/sm75-cuda-small-fusions.patch",
+    "patches/sm75-head-prefetch-dispatch.patch",
+    "patches/native-session-operator-identity.patch",
+    "patches/hc-native-blocks.patch",
+    "patches/hc-native-no-bf16.patch",
+    "patches/hc-native-session-identity.patch",
+    "patches/hc-native-load-message.patch",
+    "patches/mmq-tab-kquant-types.patch"
+  ],
+  "dependencies": [
+    {
+      "url": "https://github.com/ggml-org/llama.cpp.git",
+      "revision": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+      "path": "vendor/llama.cpp"
+    }
+  ],
+  "build": {
+    "cuda_architectures": "75-real",
+    "portable_cpu": true,
+    "q6k_experts": true,
+    "kquant_mmq": true,
+    "q5_0_mmq_coverage": true,
+    "conversation_tests": true,
+    "geometry": "flash_next",
+    "ggml_provider": "external-pinned",
+    "mmq_tab_types": "q4_K;q5_0;q8_0"
+  }
+}

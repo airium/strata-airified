@@ -1,0 +1,161 @@
+diff --git a/include/strata/core/host_graph_launch.hpp b/include/strata/core/host_graph_launch.hpp
+index a009a100..5a490b66 100644
+--- a/include/strata/core/host_graph_launch.hpp
++++ b/include/strata/core/host_graph_launch.hpp
+@@ -9,6 +9,7 @@
+ #include <utility>
+ #include "strata/platform/aux_cpus.hpp"
+ #include "strata/platform/thread_name.hpp"
++#include "strata/core/host_profile.hpp"
+ 
+ namespace strata::core {
+ 
+@@ -57,7 +58,11 @@ private:
+             const cudaGraphExec_t graph = graph_;
+             const cudaStream_t stream = stream_;
+             lock.unlock();
+-            const cudaError_t error = device_error == cudaSuccess ? cudaGraphLaunch(graph, stream) : device_error;
++            cudaError_t error;
++            {
++                host_profile::Range submit("strata.graph.submit", (uint64_t) device_);
++                error = device_error == cudaSuccess ? cudaGraphLaunch(graph, stream) : device_error;
++            }
+             lock.lock();
+             error_ = error;
+             pending_.store(false, std::memory_order_release);
+@@ -89,12 +94,14 @@ public:
+         } else if (threaded) {
+             pending_.store(true);
+             worker_ = std::thread([this, graph, device] {
++                host_profile::Range submit("strata.graph.submit", (uint64_t) device);
+                 auto error = cudaSetDevice(device);
+                 if (error == cudaSuccess) error = cudaGraphLaunch(graph, stream_);
+                 error_ = error;
+                 pending_.store(false, std::memory_order_release);
+             });
+         } else {
++            host_profile::Range submit("strata.graph.submit", (uint64_t) device);
+             error_ = cudaGraphLaunch(graph, stream_);
+         }
+     }
+diff --git a/include/strata/core/host_profile.hpp b/include/strata/core/host_profile.hpp
+new file mode 100644
+index 00000000..0bc1f3fd
+--- /dev/null
++++ b/include/strata/core/host_profile.hpp
+@@ -0,0 +1,51 @@
++#pragma once
++
++#include <cstdint>
++#include <cstdlib>
++
++// Host-only tracing: unlike STRATA_VERIFY_PROFILE, this does not insert GPU
++// stamp kernels or change the captured fusion/stream dispatch.  Optional NVTX3
++// headers come from the CUDA toolkit; other builds keep no-op ranges.
++#if !defined(STRATA_USE_HIP) && __has_include(<nvtx3/nvToolsExt.h>)
++#include <nvtx3/nvToolsExt.h>
++#define STRATA_HOST_NVTX 1
++#endif
++
++namespace strata::core::host_profile {
++inline bool enabled() {
++    static const bool on = [] {
++        const char* value = std::getenv("STRATA_VERIFY_HOST_PROFILE");
++        return value && value[0] == '1';
++    }();
++    return on;
++}
++class Range {
++public:
++    Range(const char* name, uint64_t payload) {
++#if defined(STRATA_HOST_NVTX)
++        if (!enabled()) return;
++        nvtxEventAttributes_t event{};
++        event.version = NVTX_VERSION;
++        event.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
++        event.messageType = NVTX_MESSAGE_TYPE_ASCII;
++        event.message.ascii = name;
++        event.payloadType = NVTX_PAYLOAD_TYPE_UNSIGNED_INT64;
++        event.payload.ullValue = payload;
++        nvtxRangePushEx(&event);
++        active_ = true;
++#else
++        (void) name; (void) payload;
++#endif
++    }
++    ~Range() { finish(); }
++    Range(const Range&) = delete;
++    Range& operator=(const Range&) = delete;
++    void finish() {
++#if defined(STRATA_HOST_NVTX)
++        if (active_) { nvtxRangePop(); active_ = false; }
++#endif
++    }
++private:
++    bool active_ = false;
++};
++} // namespace strata::core::host_profile
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 142f2308..9c24d251 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -1,5 +1,6 @@
+ // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
+ #include "strata/core/expert_source.hpp"
++#include "strata/core/host_profile.hpp"
+ #include "strata/core/expert_nibble.hpp"
+ #include "strata/core/conversation_memory.hpp"
+ #include "strata/core/foresight_swap.hpp"
+@@ -4928,6 +4929,8 @@ void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0,
+ 
+ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
+                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
++    strata::core::host_profile::Range service("strata.experts.service", (uint64_t) d.layers);
++    strata::core::host_profile::Range plan("strata.experts.plan", (uint64_t) d.layers);
+     using namespace strata::kernels::cpu;
+     if (d.failed) return;
+     if (n_tok < 1 || n_tok > strata::kernels::kWindowMaxT) {
+@@ -5184,6 +5187,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+         std::atomic_thread_fence(std::memory_order_seq_cst);
+         pt("publish", fetches);
+         if (P.publish) P.publish(P.ctx);
++        plan.finish();
+         pt("fetch", fetches);
+         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+     } else {
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 81966e1c..8d920881 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -10,6 +10,7 @@
+ #include "strata/core/defaults_026.hpp"
+ #include "strata/kernels/gfx_arch.hpp"
+ #include "strata/core/verify.hpp"
++#include "strata/core/host_profile.hpp"
+ #include "strata/core/window_evict.hpp"
+ #include "strata/core/expert_nibble.hpp"
+ #include "strata/core/pin_budget.hpp"
+@@ -3231,6 +3232,7 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
+ 
+ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                    std::string& err) {
++    host_profile::Range host_window("strata.verify.window", (uint64_t) device_);
+     const bool measure = spec_measure_;
+     // Clear this borrow and propagated stage borrows on every exit.
+     struct ProposalBorrow {
+@@ -3446,6 +3448,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+         auto last_flush = a;
+         uint32_t spins = 0;
+         progress_at("verify window: waiting for the GPU to reach layer", l);
++        host_profile::Range doorbell("strata.doorbell.poll", (uint64_t) l);
+         while (*seq < want) {
+             strata_cpu_pause();
+             if ((++spins & 1023u) != 0) continue;
+@@ -3484,6 +3487,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+             }
+         }
+         strata_load_fence();   // the layer rang: the GPU's activations are read after it (a no-op on x86)
++        doorbell.finish();
+         const Clock::time_point b = Clock::now();
+         if (probe_this && k == 0)
+             std::fprintf(stderr, "strata tdr-probe: window %d T=%d: the first doorbell (layer %lld) seen %.2f ms after the launch began\n", probe_idx, T,

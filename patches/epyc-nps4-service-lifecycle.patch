@@ -1,0 +1,457 @@
+diff --git a/serve/lifeline.py b/serve/lifeline.py
+index 9d7af180..e156d55c 100644
+--- a/serve/lifeline.py
++++ b/serve/lifeline.py
+@@ -252,6 +252,9 @@ atexit.register(end_children)
+ 
+ def _after_exit(child: subprocess.Popen, token: str | None) -> None:
+     child.wait()
++    if hasattr(child, "_numa_lifecycle_record"):
++        from serve import numa_lifecycle
++        numa_lifecycle.release(child)
+     with _children_lock:
+         _children.discard(child)
+     release(child)
+@@ -286,14 +289,22 @@ def popen(args, role: str = "engine", **kw) -> subprocess.Popen:
+         kw["creationflags"] = kw.get("creationflags", 0) | subprocess.CREATE_NEW_PROCESS_GROUP
+     if isolate and os.name != "nt" and "start_new_session" not in kw:
+         kw["preexec_fn"] = _own_group(kw.pop("preexec_fn", None))
++    def start():
++        # The wrapper opts in only after topology/build checks. The bootstrap
++        # execs the real engine in the same PID, preserving the protocol and
++        # lifeline's parent-death guarantee. Vision/other children stay unchanged.
++        if role == "engine" and (kw.get("env") or os.environ).get("AIRIFIED_NPS4_GUARD") == "1":
++            from serve import numa_lifecycle
++            return numa_lifecycle.guarded_popen(args, **kw)
++        return subprocess.Popen(args, **kw)
+     if how == "pdeathsig":
+         parent, then = os.getpid(), kw.pop("preexec_fn", None)
+         kw["preexec_fn"] = _die_with_parent(parent, then)
+-        child = _the_anchor().call(lambda: subprocess.Popen(args, **kw))
++        child = _the_anchor().call(start)
+     elif how == "job":
+         child = winjob.start_contained(args, **kw)   # in the job before it runs, so nothing it starts slips out
+     else:
+-        child = subprocess.Popen(args, **kw)
++        child = start()
+         _watch(child)
+     if isinstance(child, _REAL_POPEN):
+         with _children_lock:
+diff --git a/serve/numa_lifecycle.py b/serve/numa_lifecycle.py
+new file mode 100644
+index 00000000..aa5324e5
+--- /dev/null
++++ b/serve/numa_lifecycle.py
+@@ -0,0 +1,412 @@
++"""Linux EPYC/NPS4 launch policy and an owned-PID numad lease.
++
++The wrapper enables this only for a verified topology/build. The native engine
++keeps its real PID and pipe protocol: a fresh Python bootstrap registers that
++PID before exec, and an independent pidfd watcher releases it even after SIGKILL
++of the API server. No daemon-wide numad setting is changed.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from pathlib import Path
++import select
++import shutil
++import signal
++import subprocess
++import sys
++import time
++import uuid
++
++GUARD = "AIRIFIED_NPS4_GUARD"
++STATE_DIR = "AIRIFIED_NPS4_STATE_DIR"
++REQUIRED_PATCHES = {
++    "nps4-expert-row-placement.patch", "plan-nps4-pool-before-arena.patch",
++    "nps4-mapped-arena-guard-and-contracts.patch",
++}
++TERMINAL = {"removed", "daemon-absent", "daemon-replaced", "pid-reused", "failed"}
++
++
++def cpu_list(value: str) -> set[int]:
++    out = set()
++    for item in value.strip().split(","):
++        if not item:
++            continue
++        ends = item.split("-")
++        a, b = int(ends[0]), int(ends[-1])
++        if a < 0 or b < a:
++            raise ValueError("invalid CPU range")
++        out.update(range(a, b + 1))
++    return out
++
++
++def _under(root: Path, path: str) -> Path:
++    return root / path.lstrip("/")
++
++
++def effective_cpus(root: Path = Path("/")) -> set[int]:
++    """Read the cgroup limit, not an affinity mask numad may already have narrowed."""
++    online = cpu_list(_under(root, "/sys/devices/system/cpu/online").read_text())
++    lines = _under(root, "/proc/self/cgroup").read_text().splitlines()
++    group = next(line[3:] for line in lines if line.startswith("0::"))
++    mounts = _under(root, "/proc/self/mountinfo").read_text().splitlines()
++    for line in mounts:
++        left, kind = line.split(" - ", 1)
++        if kind.split()[0] != "cgroup2":
++            continue
++        fields = left.split(); mount_root, mount_point = fields[3:5]
++        # mountinfo escapes are not shell quoting.
++        for old, new in [("\\040", " "), ("\\011", "\t"), ("\\134", "\\")]:
++            mount_root = mount_root.replace(old, new); mount_point = mount_point.replace(old, new)
++        rel = Path(group).relative_to(mount_root)
++        base = _under(root, mount_point); directory = base / rel
++        if not directory.is_dir():
++            raise ValueError("current cgroup is not visible")
++        # A controller need not be enabled at the leaf; its nearest visible
++        # ancestor supplies the inherited restriction.
++        while True:
++            file = directory / "cpuset.cpus.effective"
++            if file.exists():
++                allowed = cpu_list(file.read_text())
++                if allowed:
++                    return online & allowed
++            if directory == base:
++                break
++            directory = directory.parent
++    raise ValueError("cannot establish the effective cgroup CPU set")
++
++
++def topology(root: Path = Path("/"), platform: str | None = None) -> dict:
++    report = {"eligible": False, "reason": "not Linux"}
++    if not (platform or sys.platform).startswith("linux"):
++        return report
++    try:
++        info = _under(root, "/proc/cpuinfo").read_text()
++        vendors = {line.split(":", 1)[1].strip() for line in info.splitlines() if line.startswith("vendor_id")}
++        models = {line.split(":", 1)[1].strip() for line in info.splitlines() if line.startswith("model name")}
++        report.update(models=sorted(models))
++        if vendors != {"AuthenticAMD"} or not models or not all("EPYC" in x.upper() for x in models):
++            report["reason"] = "not AMD EPYC"; return report
++        online = cpu_list(_under(root, "/sys/devices/system/cpu/online").read_text())
++        allowed = effective_cpus(root)
++        if allowed != online:
++            report["reason"] = "restricted cgroup CPU set"; return report
++        packages = {int(_under(root, f"/sys/devices/system/cpu/cpu{n}/topology/physical_package_id").read_text()) for n in online}
++        if len(packages) != 1:
++            report["reason"] = "requires one socket, not four nodes spread across sockets"; return report
++        node_root = _under(root, "/sys/devices/system/node")
++        nodes = []; covered = set()
++        for directory in sorted(node_root.glob("node[0-9]*")):
++            cpus = cpu_list((directory / "cpulist").read_text()) & online
++            memory = next(int(x.split()[-2]) for x in (directory / "meminfo").read_text().splitlines() if "MemTotal:" in x)
++            if not cpus or memory <= 0:
++                report["reason"] = "memoryless or CPU-less NUMA node"; return report
++            if covered & cpus:
++                raise ValueError("overlapping NUMA CPU lists")
++            covered |= cpus; nodes.append({"node": int(directory.name[4:]), "cpus": sorted(cpus), "memory_kib": memory})
++        if len(nodes) != 4 or covered != online or len({len(x["cpus"]) for x in nodes}) != 1:
++            report["reason"] = "not a complete balanced four-node socket"; return report
++        status = _under(root, "/proc/self/status").read_text().splitlines()
++        memory_allowed = cpu_list(next(x.split(":", 1)[1] for x in status if x.startswith("Mems_allowed_list:")))
++        if not {x["node"] for x in nodes} <= memory_allowed:
++            report["reason"] = "restricted cgroup memory-node set"; return report
++        # Accept normal firmware/kernel reservations, not a strongly asymmetric
++        # memory layout that merely happens to expose four node numbers.
++        sizes = [x["memory_kib"] for x in nodes]
++        if min(sizes) < .90 * max(sizes):
++            report["reason"] = "asymmetric NUMA memory"; return report
++        report.update(eligible=True, reason="single EPYC socket with four CPU/memory nodes (effective NPS4)",
++                      cpus=sorted(allowed), nodes=nodes)
++    except (OSError, ValueError, StopIteration, IndexError) as error:
++        report["reason"] = f"topology unavailable: {error}"
++    return report
++
++
++def build_support(exe: str) -> bool:
++    try:
++        binary = Path(exe).resolve(); metadata = json.loads((binary.parent / "BUILD.json").read_text())
++        patches = {Path(x["path"] if isinstance(x, dict) else x).name for x in metadata["patches"]}
++        payload = metadata["payloads"][binary.name]
++        if not REQUIRED_PATCHES <= patches or binary.stat().st_size != payload["bytes"]:
++            return False
++        digest = hashlib.sha256()
++        with binary.open("rb") as stream:
++            for data in iter(lambda: stream.read(1 << 20), b""):
++                digest.update(data)
++        return digest.hexdigest() == payload["sha256"]
++    except (OSError, ValueError, KeyError, TypeError):
++        return False
++
++
++def configuration(exe: str, env: dict, mode: str, state_dir: str, *, root: Path = Path("/")) -> dict:
++    if mode not in ("auto", "off"):
++        raise ValueError("CPU_NUMA_POLICY must be auto or off")
++    report = {"mode": mode, "enabled": False, "reason": "automatic CPU policy disabled"}
++    if mode == "off":
++        return report
++    if env.get("STRATA_NUMA_SPLIT") not in (None, "4"):
++        report["reason"] = "explicit STRATA_NUMA_SPLIT override"; return report
++    report.update(topology(root)); report.pop("eligible", None)
++    if "cpus" not in report:
++        return report
++    if not build_support(exe):
++        report["reason"] = "selected native build lacks verified NPS4 support"; return report
++    report["enabled"] = True
++    return report
++
++
++def identity(pid: int) -> tuple[str, str] | None:
++    try:
++        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
++        return fields[19], fields[0]
++    except (OSError, ValueError, IndexError):
++        return None
++
++
++def daemon_identity(pidfile: str = "/run/numad.pid") -> tuple[int, str] | None:
++    try:
++        pid = int(Path(pidfile).read_text().strip()); ident = identity(pid)
++        if pid <= 1 or ident is None or ident[1] == "Z" or Path(f"/proc/{pid}/comm").read_text().strip() != "numad":
++            return None
++        return pid, ident[0]
++    except (OSError, ValueError):
++        return None
++
++
++def control_command() -> list[str]:
++    binary = shutil.which("numad")
++    if not binary:
++        raise RuntimeError("numad is running but its control program is unavailable")
++    if os.geteuid() == 0:
++        return [binary]
++    sudo = shutil.which("sudo")
++    if not sudo:
++        raise RuntimeError("numad exclusion requires noninteractive permission (sudo -n)")
++    return [sudo, "-n", "--", binary]
++
++
++def control(command: list[str], action: str, pid: int) -> None:
++    if action not in ("-x", "-r") or pid <= 1:
++        raise ValueError("invalid owned-PID numad operation")
++    # -w is read-only advice, and makes the client query-only if the daemon
++    # disappears: unlike a bare -x/-r, it must never start a new daemon. A second
++    # query is an IPC ordering barrier after -x (numad sends -x after -w).
++    for tail in ([action, str(pid), "-w", "0"], ["-w", "0"]):
++        done = subprocess.run([*command, *tail], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=8)
++        if done.returncode:
++            raise RuntimeError("numad owned-PID control failed: " + (done.stderr + done.stdout).strip())
++
++
++def write_record(path: Path, record: dict) -> None:
++    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
++    with temporary.open("x", encoding="utf-8") as out:
++        os.chmod(temporary, 0o600); json.dump(record, out, indent=2); out.write("\n")
++    os.replace(temporary, path)
++
++
++def cleanup(plan: dict, record: dict) -> None:
++    current = identity(record["engine_pid"])
++    if current and current[0] != record["start_ticks"]:
++        record["status"] = "pid-reused"
++    elif record.get("daemon") and daemon_identity(plan["pidfile"]) == tuple(record["daemon"]):
++        control(plan["command"], "-r", record["engine_pid"])
++        record["status"] = "removed"
++    else:
++        record["status"] = "daemon-absent" if not daemon_identity(plan["pidfile"]) else "daemon-replaced"
++    record["finished_unix"] = time.time(); write_record(Path(plan["record"]), record)
++
++
++def guardian(plan: dict, ack: int) -> int:
++    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
++        signal.signal(sig, signal.SIG_IGN)
++    record = {"engine_pid": plan["pid"], "start_ticks": plan["token"], "guardian_pid": os.getpid(),
++              "guardian_start_ticks": identity(os.getpid())[0], "uid": os.getuid(), "engine_exe": plan["exe"],
++              "owner_pid": plan["owner"], "boot_id": Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
++              "created_unix": time.time(), "status": "preparing", "daemon": None}
++    path = Path(plan["record"]); write_record(path, record)
++    pidfd = None
++    try:
++        pidfd = os.pidfd_open(plan["pid"]) if hasattr(os, "pidfd_open") else None
++        def register():
++            daemon = daemon_identity(plan["pidfile"])
++            if daemon:
++                if not plan["command"]:
++                    plan["command"] = control_command()
++                current = identity(plan["pid"])
++                if current is None or current[0] != plan["token"] or current[1] == "Z":
++                    raise RuntimeError("owned engine exited before numad registration")
++                record['daemon'] = list(daemon); write_record(path, record)
++                control(plan["command"], "-x", plan["pid"])
++                if daemon_identity(plan["pidfile"]) != daemon:
++                    raise RuntimeError("numad changed while registering the engine; retry startup")
++                record["status"] = "excluded"
++            else:
++                record["daemon"] = None; record["status"] = "watching-no-daemon"
++            write_record(path, record)
++        register()
++        os.write(ack, b"OK\n"); os.close(ack); ack = -1
++        while True:
++            if pidfd is not None:
++                if select.select([pidfd], [], [], 1)[0]:
++                    break
++            else:
++                time.sleep(.2)
++            current = identity(plan["pid"])
++            if current is None or current[0] != plan["token"] or current[1] == "Z":
++                break
++            daemon = daemon_identity(plan["pidfile"])
++            if daemon != (tuple(record["daemon"]) if record["daemon"] else None):
++                register()  # a replacement daemon has a new exclusion list
++        cleanup(plan, record)
++        return 0
++    except BaseException as error:
++        record["error"] = repr(error)
++        if ack >= 0:
++            try:os.write(ack, ("ERROR " + str(error)).encode())
++            except OSError:pass
++        else:
++            # Losing control after startup must not silently leave the engine
++            # running with a placement policy another daemon can overwrite.
++            current = identity(plan["pid"])
++            if current and current[0] == plan["token"] and current[1] != "Z":
++                try:
++                    if pidfd is not None and hasattr(signal, "pidfd_send_signal"):
++                        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
++                    else:os.kill(plan["pid"], signal.SIGTERM)
++                except ProcessLookupError:pass
++        # Registration may have succeeded before a later startup error. Release
++        # our lease only; do not leave an excluded PID behind on a failed start.
++        try:cleanup(plan, record)
++        except Exception as cleanup_error:
++            record.update(status="failed", cleanup_error=repr(cleanup_error)); write_record(path, record)
++        return 1
++    finally:
++        if ack >= 0:os.close(ack)
++        if pidfd is not None:os.close(pidfd)
++
++
++def bootstrap(error_fd: int, plan: dict, args: list[str]) -> int:
++    os.set_inheritable(error_fd, False)  # EOF tells the API parent that native exec succeeded
++    try:
++        current = sorted(os.sched_getaffinity(0))
++        if current != plan["inherited_affinity"]:
++            raise RuntimeError("explicit child CPU affinity conflicts with automatic NPS4; use CPU_NUMA_POLICY=off")
++        if sorted(effective_cpus()) != plan["cpus"]:
++            raise RuntimeError("cgroup CPU eligibility changed during launch; re-render configuration")
++        plan.update(pid=os.getpid(), token=identity(os.getpid())[0])
++        plan["record"] = str(Path(plan["state_dir"]) / f"engine-{plan['pid']}-{plan['token']}.json")
++        read, write = os.pipe()
++        watcher = subprocess.Popen([sys.executable, "-S", str(Path(__file__).resolve()), "--guardian", str(write), json.dumps(plan)],
++                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=sys.stderr,
++                                   pass_fds=(write,), close_fds=True, start_new_session=True)
++        os.close(write)
++        if not select.select([read], [], [], 25)[0]:
++            raise RuntimeError("numad guardian registration timed out")
++        reply = os.read(read, 8192); os.close(read)
++        if reply != b"OK\n":
++            raise RuntimeError(reply.decode("utf-8", "replace") or "numad guardian exited before registration")
++        os.sched_setaffinity(0, plan["cpus"])
++        os.execvpe(args[0], args, os.environ)
++    except BaseException as error:
++        try:os.write(error_fd, ("NPS4 startup failed: " + str(error)).encode())
++        except OSError:pass
++        return 126
++
++
++def guarded_popen(args, *, _controller: dict | None = None, **kw):
++    """Called from lifeline's anchor with its existing death signal/group setup."""
++    env = kw.get("env") or os.environ
++    report = topology()
++    if not report["eligible"] or env.get("STRATA_NUMA_SPLIT") != "4":
++        raise OSError("automatic NPS4 guard no longer matches topology/configuration: " + report["reason"])
++    state = Path(env[STATE_DIR]).resolve(); state.mkdir(parents=True, exist_ok=True)
++    daemon = daemon_identity()
++    plan = {"owner": os.getpid(), "state_dir": str(state), "cpus": report["cpus"], "exe":str(Path(args[0]).resolve()),
++            "inherited_affinity": sorted(os.sched_getaffinity(0)), "pidfile": "/run/numad.pid",
++            "command": control_command() if daemon else []}
++    if _controller is not None:
++        plan.update(_controller)  # explicit dependency injection for process tests, never an environment override
++    if not plan["command"]:
++        # Resolve lazily when a daemon appears after launch; its watcher uses the
++        # same ordinary client command and never starts a daemon itself.
++        binary = shutil.which("numad")
++        plan["command"] = ([binary] if os.geteuid() == 0 else [shutil.which("sudo") or "sudo", "-n", "--", binary]) if binary else []
++    recover_stale(state, plan)
++    read, write = os.pipe()
++    launch = [sys.executable, "-S", str(Path(__file__).resolve()), "--bootstrap", str(write), json.dumps(plan), *args]
++    pass_fds = tuple(kw.pop("pass_fds", ())) + (write,)
++    try:
++        child = subprocess.Popen(launch, pass_fds=pass_fds, **kw)
++    except BaseException:
++        os.close(read)
++        raise
++    finally:
++        os.close(write)
++    try:
++        ident = identity(child.pid)
++        if ident:
++            child._numa_lifecycle_record = state / f"engine-{child.pid}-{ident[0]}.json"
++            child._numa_lifecycle_plan = dict(plan, pid=child.pid, token=ident[0], record=str(child._numa_lifecycle_record))
++        if not select.select([read], [], [], 35)[0]:
++            raise OSError("automatic NPS4 bootstrap timed out")
++        failure = os.read(read, 16384)
++        if failure:
++            raise OSError(failure.decode("utf-8", "replace"))
++        return child
++    except BaseException:
++        child.kill(); child.wait(timeout=10)
++        release(child)
++        raise
++    finally:
++        os.close(read)
++
++
++def release(child) -> None:
++    """The independent watcher owns cleanup; wait for its small journal update."""
++    record = getattr(child, "_numa_lifecycle_record", None)
++    if record is None:
++        return
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline:
++        try:
++            row = json.loads(record.read_text())
++            if row.get("status") in TERMINAL and not row.get("cleanup_error"):
++                return
++        except (OSError, ValueError):
++            pass
++        time.sleep(.05)
++    plan = getattr(child, "_numa_lifecycle_plan", None)
++    if plan is not None:
++        # Backstop if the watcher itself crashed. No signal is sent here, and
++        # cleanup rechecks the original native PID/start identity.
++        recover_stale(Path(plan["state_dir"]), plan)
++
++
++def recover_stale(state: Path, plan: dict) -> None:
++    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
++    for file in state.glob("engine-*-*.json"):
++        row = json.loads(file.read_text())
++        if file.stat().st_uid != os.getuid() or row.get("uid") != os.getuid():
++            continue
++        if file.name != f"engine-{row.get('engine_pid')}-{row.get('start_ticks')}.json":
++            continue
++        if row.get("status") in TERMINAL and not row.get("cleanup_error"):
++            continue
++        watcher = identity(row["guardian_pid"])
++        if watcher and watcher[0] == row.get("guardian_start_ticks") and watcher[1] != "Z":
++            continue
++        current = identity(row["engine_pid"])
++        if current and current[0] == row["start_ticks"] and current[1] != "Z":
++            continue  # a different live service still owns this engine
++        if row.get("boot_id") != boot:
++            row["status"] = "daemon-replaced"; write_record(file, row); continue
++        cleanup({**plan, "record":str(file)}, row)
++
++
++if __name__ == "__main__":
++    if len(sys.argv) >= 4 and sys.argv[1] == "--guardian":
++        raise SystemExit(guardian(json.loads(sys.argv[3]), int(sys.argv[2])))
++    if len(sys.argv) >= 5 and sys.argv[1] == "--bootstrap":
++        raise SystemExit(bootstrap(int(sys.argv[2]), json.loads(sys.argv[3]), sys.argv[4:]))
++    raise SystemExit("internal Strata engine lifecycle helper")

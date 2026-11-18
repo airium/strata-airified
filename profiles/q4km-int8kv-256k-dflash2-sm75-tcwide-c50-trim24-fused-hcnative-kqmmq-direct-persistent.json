@@ -1,0 +1,29 @@
+{
+  "context": 262144,
+  "kv": "int8",
+  "prefill": "auto",
+  "spec": 4,
+  "spec_min_p": 0.5,
+  "draft_conf": 0.5,
+  "layer_split": "24",
+  "prompt_cache": 6,
+  "prompt_cache_every": 16384,
+  "prompt_cache_tail": true,
+  "persistent_cache": true,
+  "environment": {
+    "STRATA_SESSION_ALL_CHECKPOINTS": "1",
+    "STRATA_SM75_PERF": "1",
+    "STRATA_BF16_TC": "1",
+    "STRATA_BF16_TC_WIDE_X": "1",
+    "STRATA_EXPERT_V2K": "1",
+    "STRATA_EXPERT_V2K_Q50": "1",
+    "STRATA_FUSE_CONVAB": "1",
+    "STRATA_FUSE_HITS": "1",
+    "STRATA_SM75_HEAD_PF": "1",
+    "STRATA_HC_NATIVE": "1",
+    "STRATA_HC_NATIVE_NO_BF16": "1",
+    "STRATA_MMQ_KQ": "1",
+    "STRATA_MMQ_DIRECT": "1"
+  },
+  "trim_stage_weights": true
+}

@@ -1,0 +1,14 @@
+diff --git a/include/strata/core/host_graph_launch.hpp b/include/strata/core/host_graph_launch.hpp
+index 5a490b66..48fbb831 100644
+--- a/include/strata/core/host_graph_launch.hpp
++++ b/include/strata/core/host_graph_launch.hpp
+@@ -48,7 +48,9 @@ public:
+     }
+ private:
+     void loop() {
++#if !defined(_WIN32)
+         strata::platform::name_this_thread("strata-launch", device_);
++#endif
+         (void) strata::aux_cpus::place_off_host();
+         const cudaError_t device_error = cudaSetDevice(device_);
+         std::unique_lock<std::mutex> lock(mu_);

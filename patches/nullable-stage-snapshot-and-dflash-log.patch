@@ -1,0 +1,215 @@
+diff --git a/include/strata/core/conversation_snapshot.hpp b/include/strata/core/conversation_snapshot.hpp
+index 27ba8c9b..3aa94ae4 100644
+--- a/include/strata/core/conversation_snapshot.hpp
++++ b/include/strata/core/conversation_snapshot.hpp
+@@ -56,6 +56,15 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
+                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                       std::string& error);
+ 
++struct ConversationView;
++// Multi-stage disk sessions: the draft belongs only to its owning stage, or is absent.
++bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
++                                   const ConversationView& view, const SessionState& session,
++                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
++bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
++                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
++                                      std::string& error);
++
+ struct ConversationStateSizes {
+     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
+ };
+diff --git a/include/strata/core/dflash2.hpp b/include/strata/core/dflash2.hpp
+index 5fbf1757..64008e7d 100644
+--- a/include/strata/core/dflash2.hpp
++++ b/include/strata/core/dflash2.hpp
+@@ -69,6 +69,13 @@ public:
+     bool clone_bind(const Dflash2Drafter& parent, std::string& err);    ///< after the parent's bind: the shared head, embedding and the draft logits
+     /// Copy another drafter's context (ring, tags, token history, epoch) exactly: a request that moves between the solo session and a batch slot.  Same card.
+     bool copy_state_from(Dflash2Drafter& src, std::string& err);
++    // Native disk sessions retain quantized context rows. The existing ring-log
++    // rebuild regenerates identical K/V; no weights or raw device addresses are saved.
++    uint64_t session_state_limit(uint64_t max_tokens) const;
++    bool save_session_state(std::vector<uint8_t>& out, std::string& err);
++    bool prepare_session_restore(const std::vector<uint8_t>& bytes, uint64_t max_tokens, std::string& err);
++    void commit_session_restore(); // host-only commit after all target stages restored
++
+     /// A fixed device buffer [kRows][taps][n_embd] on this drafter's card: where a layer split's stages land their taps (Verifier::gather_taps) and the
+     /// graphs are captured on it.  Allocated at load.
+     float* landing() const { return landing_; }
+@@ -249,6 +256,7 @@ private:
+         void truncate(int64_t keep);                      ///< forget the rows of positions >= keep
+         LogChunk& writable(size_t chunk);                 ///< the chunk, allocated or un-shared first
+     };
++    std::unique_ptr<Lineage> session_pending_;
+     Lineage cur_;                                         ///< the lineage the ring belongs to
+     std::deque<Lineage> stash_;                           ///< parked lineages, newest last
+     bool log_on_ = false;           ///< set by init_ring_log() once the pinned staging exists
+diff --git a/src/core/conversation_state.cpp b/src/core/conversation_state.cpp
+index b02f066a..ed0e04ee 100644
+--- a/src/core/conversation_state.cpp
++++ b/src/core/conversation_state.cpp
+@@ -621,7 +621,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
+ 
+ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                    const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+-                                   const QsaState& draft, std::string& error) {
++                                   const QsaState* draft, std::string& error) {
+     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
+     SavedConversation captured;
+     captured.geometry = geometry_key(g);
+@@ -633,17 +633,17 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
+     conversation_checkpoint_join(captured.live.gdn.data());
+     const int64_t upto = (int64_t) view.ids.size();
+     const size_t layers = owned_qsa(ss);
+-    std::vector<SessionKvSource> out(layers + 1);
++    std::vector<SessionKvSource> out(layers + (draft ? 1 : 0));
+     for (size_t j = 0; j < layers; ++j)
+         if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
+-    if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
++    if (draft && !conversation_kv_source(out.back(), *draft, g, upto, false, error)) return false;
+     meta = std::move(captured);
+     sources = std::move(out);
+     return true;
+ }
+ 
+ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
+-                                      const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
++                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                       std::string& error) {
+     ConversationStateSizes z;
+     if (!conversation_session_sizes(g, ss, z, error)) return false;
+@@ -657,22 +657,35 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
+     SessionReadLimits l = limits;   // keeps the caller's admit / progress / max_file_bytes
+     l.max_tokens = tokens;
+     l.max_checkpoints = max_checkpoints;
+-    l.max_kv_layers = layers + 1;
++    l.max_kv_layers = layers + (draft ? 1 : 0);
+     l.geometry = geometry_key(g);
+     l.layer_range = std::make_pair(ss.layer_lo, ss.layer_hi);
+     l.max_state_bytes = {z.gdn, ss.ple_hist ? z.ple : 0, tails, dead, block_pos};
+-    l.max_kv_bytes.assign(layers + 1, {});
++    l.max_kv_bytes.assign(layers + (draft ? 1 : 0), {});
+     for (size_t j = 0; j < layers; ++j) {
+         const auto& st = owned(ss, j);
+         const int64_t upto = (int64_t) std::min<uint64_t>(tokens, (uint64_t) std::max<int64_t>(st.max_cells, 0));
+         if (!conversation_kv_part_sizes(st, g, upto, true, l.max_kv_bytes[j], error)) return false;
+     }
+-    const int64_t dupto = (int64_t) std::min<uint64_t>(tokens, (uint64_t) std::max<int64_t>(draft.max_cells, 0));
+-    if (!conversation_kv_part_sizes(draft, g, dupto, false, l.max_kv_bytes.back(), error)) return false;
++    if (draft) {
++        const int64_t dupto = (int64_t) std::min<uint64_t>(tokens, (uint64_t) std::max<int64_t>(draft->max_cells, 0));
++        if (!conversation_kv_part_sizes(*draft, g, dupto, false, l.max_kv_bytes.back(), error)) return false;
++    }
+     limits = std::move(l);
+     return true;
+ }
+ 
++bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
++                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
++                                   const QsaState& draft, std::string& error) {
++    return conversation_snapshot_sources(meta, sources, view, ss, g, &draft, error);
++}
++bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
++                                      const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
++                                      std::string& error) {
++    return conversation_session_read_limits(limits, ss, g, &draft, max_tokens, max_checkpoints, error);
++}
++
+ bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
+                                     const ModelGeometry& g, const QsaState* draft, std::string& error) {
+     if (!image.live.stage_parts.empty())
+diff --git a/src/core/dflash2.cpp b/src/core/dflash2.cpp
+index eb96c043..5ca12aa4 100644
+--- a/src/core/dflash2.cpp
++++ b/src/core/dflash2.cpp
+@@ -11,6 +11,8 @@
+ #include "strata/kernels/verify_kernels.hpp"
+ 
+ #include <algorithm>
++#include <cmath>
++#include <climits>
+ #include <cstdlib>
+ #include <chrono>
+ #include <cstdio>
+@@ -760,6 +762,81 @@ void Dflash2Drafter::init_ring_log() {
+     }
+ }
+ 
++uint64_t Dflash2Drafter::session_state_limit(uint64_t max_tokens) const {
++    if (max_tokens > (uint64_t) INT32_MAX) return UINT64_MAX;
++    const uint64_t chunks = (max_tokens + kLogChunk - 1) / kLogChunk + 1;
++    return 80 + max_tokens * 4 + chunks * (8 + (uint64_t) kLogChunk * (2560 + 80 * 4 + 1));
++}
++
++bool Dflash2Drafter::save_session_state(std::vector<uint8_t>& out, std::string& err) {
++    if (!log_on_ || N_ != 2560) { err = "dflash2: session persistence needs the ring log"; return false; }
++    if (!context_wait(err)) return false;
++    const OnDevice on_device(device_);
++    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "dflash2: sync before session save"; return false; }
++    log_flush();
++    out.clear();
++    auto raw = [&](const void* p, size_t n) { const auto* b = (const uint8_t*) p; if (n) out.insert(out.end(), b, b + n); };
++    auto u64 = [&](uint64_t v) { raw(&v, 8); };
++    raw("DF2LOG01", 8);
++    for (uint64_t v : {uint64_t(N_), uint64_t(L_), uint64_t(NKV_), uint64_t(HD_), uint64_t(window_),
++                       uint64_t(cur_.hist.size()), uint64_t(cur_.chunks.size())}) u64(v);
++    raw(cur_.hist.data(), cur_.hist.size() * 4);
++    for (const auto& c : cur_.chunks) {
++        u64(c ? 1 : 0);
++        if (c) { raw(c->q.data(), c->q.size()); raw(c->d.data(), c->d.size() * 4); raw(c->ok.data(), c->ok.size()); }
++    }
++    return true;
++}
++
++bool Dflash2Drafter::prepare_session_restore(const std::vector<uint8_t>& bytes, uint64_t max_tokens, std::string& err) {
++    session_pending_.reset();
++    auto fail = [&](const char* why) { err = std::string("dflash2 session: ") + why; return false; };
++    if (!log_on_ || N_ != 2560) return fail("ring log unavailable");
++    if (bytes.size() < 64 || bytes.size() > session_state_limit(max_tokens) || std::memcmp(bytes.data(), "DF2LOG01", 8))
++        return fail("invalid header or extent");
++    size_t at = 8;
++    auto raw = [&](void* p, size_t n) {
++        if (n > bytes.size() - at) return false;
++        if (n) std::memcpy(p, bytes.data() + at, n);
++        at += n; return true;
++    };
++    auto u64 = [&](uint64_t& v) { return raw(&v, 8); };
++    uint64_t n = 0, layers = 0, heads = 0, dim = 0, window = 0, history = 0, chunks = 0;
++    if (!u64(n) || !u64(layers) || !u64(heads) || !u64(dim) || !u64(window) || !u64(history) || !u64(chunks) ||
++        n != (uint64_t) N_ || layers != (uint64_t) L_ || heads != (uint64_t) NKV_ || dim != (uint64_t) HD_ || window != (uint64_t) window_)
++        return fail("another drafter geometry/window");
++    if (history > max_tokens || chunks > (max_tokens + kLogChunk - 1) / kLogChunk + 1 || history > (bytes.size() - at) / 4)
++        return fail("counts exceed runtime bounds");
++    auto parsed = std::make_unique<Lineage>();
++    parsed->hist.resize((size_t) history);
++    if (!raw(parsed->hist.data(), (size_t) history * 4)) return fail("truncated token history");
++    for (int32_t token : parsed->hist) if (token < 0) return fail("invalid history token");
++    parsed->chunks.resize((size_t) chunks);
++    constexpr size_t qbytes = kLogChunk * 2560, dcount = kLogChunk * 80;
++    for (size_t i = 0; i < (size_t) chunks; ++i) {
++        uint64_t present = 0;
++        if (!u64(present) || present > 1) return fail("invalid chunk presence");
++        if (!present) continue;
++        if (qbytes + dcount * 4 + kLogChunk > bytes.size() - at) return fail("truncated log chunk");
++        auto c = std::make_shared<LogChunk>(); c->q.resize(qbytes); c->d.resize(dcount); c->ok.resize(kLogChunk);
++        if (!raw(c->q.data(), qbytes) || !raw(c->d.data(), dcount * 4) || !raw(c->ok.data(), kLogChunk)) return fail("truncated log");
++        for (uint8_t valid : c->ok) if (valid > 1) return fail("invalid row mask");
++        for (float scale : c->d) if (!std::isfinite(scale) || scale < 0) return fail("invalid quantization scale");
++        parsed->chunks[i] = std::move(c);
++    }
++    if (at != bytes.size()) return fail("unparsed log bytes");
++    session_pending_ = std::move(parsed);
++    return true;
++}
++
++void Dflash2Drafter::commit_session_restore() {
++    auto parsed = std::move(session_pending_);
++    reset();
++    if (parsed) { cur_ = std::move(*parsed); have_ctx_ = (int64_t) cur_.hist.size(); }
++    launched_ = false;
++    dpend_lo_ = dpend_hi_ = 0;
++}
++
+ void Dflash2Drafter::reset() {
+     have_ctx_ = 0;
+     cur_ = Lineage{};

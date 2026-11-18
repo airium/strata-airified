@@ -1,0 +1,719 @@
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index bf4fcfa7..fe17e98d 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -135,7 +135,7 @@ uint64_t numa_pin_free(uint64_t global_free, const std::vector<uint64_t>& node_f
+ /// (first == second). Adjacent roles smaller than a page may give overlapping slice-0 ranges: harmless (same node, the
+ /// caller coalesces them).
+ std::array<std::pair<uint64_t, uint64_t>, 3> numa_slice_ranges(uint64_t slot_off, const uint64_t role_bytes[3],
+-                                                               int slice, uint64_t page = 4096);
++                                                               int slice, uint64_t page = 4096, int slices = 2);
+ /// The sentence appended to a "not enough RAM" start failure: how much of the RAM is file cache (Cached + Buffers of
+ /// `meminfo_text`, mapped pages included) and what to do about it; "" when under 1 GiB of cache (nothing to say).
+ std::string page_cache_hint(const std::string& meminfo_text);
+diff --git a/include/strata/core/pinned.hpp b/include/strata/core/pinned.hpp
+index 7e20a357..923cc8d4 100644
+--- a/include/strata/core/pinned.hpp
++++ b/include/strata/core/pinned.hpp
+@@ -16,6 +16,7 @@
+ 
+ #include <atomic>
+ #include <cstdint>
++#include <functional>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -73,6 +74,10 @@ struct PinnedArena {
+     /// existing allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
+     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes = 0,
+                 const std::string& shared_file = {}, uint64_t shared_pack_hash = 0);
++    /// Opt-in private NUMA arena: reserve 4 KiB pages, first-touch before CUDA registers them.
++    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes,
++                const std::string& shared_file, uint64_t shared_pack_hash,
++                const std::function<void(uint8_t*, uint64_t)>& first_touch);
+     /// Pin by need (STRATA_PIN_BY_NEED=1): register only the given byte ranges (offset, length), in the given order
+     /// (the caller's priority: the hottest experts the GPU does not hold first), each rounded out to 4 KiB pages and
+     /// trimmed against the ranges already registered; stops at the first refusal of the driver (the WDDM budget is
+diff --git a/include/strata/kernels/cpu/numa_pool.hpp b/include/strata/kernels/cpu/numa_pool.hpp
+index 5db33846..176ac7ec 100644
+--- a/include/strata/kernels/cpu/numa_pool.hpp
++++ b/include/strata/kernels/cpu/numa_pool.hpp
+@@ -86,17 +86,20 @@ inline NumaPoolPick pick_numa_pool(const char* pool_env, const char* split_env,
+ struct NumaSplitDecision {
+     bool on = false;
+     std::string why;               ///< the reason when off
+-    int nodes[2] = {-1, -1};       ///< the two node ids, ascending
++    int slices = 2;
++    int nodes[kMaxNumaSlices] = {-1, -1, -1, -1};       ///< the two node ids, ascending
+     std::vector<int> slice;        ///< each thread's slice (0 or 1)
+-    int per[2] = {0, 0};           ///< threads per slice
++    int per[kMaxNumaSlices] = {};           ///< threads per slice
+ };
+ 
+ /// The real-node split of a pool whose threads sit on `thread_core` (workers first, then the host when it drains; -1 = no core).
+ /// `n_workers` tells a worker from the host in the messages; `pinned` is whether the pool pins its threads; `rotate` is
+ /// STRATA_EXCHANGE_ROTATE=1 (experts move between slots, the split needs fixed ones); `node_of(core)` is the core's NUMA node or -1.
+ inline NumaSplitDecision decide_numa_split(const std::vector<int>& thread_core, int n_workers, bool pinned, bool rotate,
+-                                           const std::function<int(int)>& node_of) {
++                                           const std::function<int(int)>& node_of, int required_nodes = 2) {
+     NumaSplitDecision d;
++    d.slices = required_nodes;
++    if (required_nodes != 2 && required_nodes != 4) { d.why = "supported NUMA slice counts are 2 and 4"; return d; }
+     const int threads = (int) thread_core.size();
+     std::vector<int> node((size_t) threads, -1);
+     if (threads < 2) {
+@@ -125,24 +128,23 @@ inline NumaSplitDecision decide_numa_split(const std::vector<int>& thread_core,
+     std::vector<int> nodes = node;
+     std::sort(nodes.begin(), nodes.end());
+     nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+-    if (nodes.size() != 2) {
+-        d.why = "the pool's threads span " + std::to_string(nodes.size()) + " NUMA node(s), the NUMA split supports exactly 2";
++    if ((int) nodes.size() != required_nodes) {
++        d.why = "the pool's threads span " + std::to_string(nodes.size()) + " NUMA node(s), the NUMA split supports exactly " + std::to_string(required_nodes);
+         return d;
+     }
+-    d.nodes[0] = nodes[0];
+-    d.nodes[1] = nodes[1];
++    for (int k = 0; k < required_nodes; ++k) d.nodes[k] = nodes[k];
+     d.slice.assign((size_t) threads, 0);
+     for (int j = 0; j < threads; ++j) {
+-        d.slice[(size_t) j] = node[(size_t) j] == nodes[1] ? 1 : 0;
++        d.slice[(size_t) j] = (int) (std::lower_bound(nodes.begin(), nodes.end(), node[(size_t) j]) - nodes.begin());
+         ++d.per[d.slice[(size_t) j]];
+     }
+-    if (!numa_slices_balanced(d.per[0], d.per[1])) {
++    if (*std::min_element(d.per, d.per + required_nodes) * 2 < *std::max_element(d.per, d.per + required_nodes)) {
+         d.why = "slices too unbalanced (node " + std::to_string(nodes[0]) + ": " + std::to_string(d.per[0]) + " thread" +
+                 (d.per[0] == 1 ? "" : "s") + ", node " + std::to_string(nodes[1]) + ": " + std::to_string(d.per[1]) + " thread" +
+                 (d.per[1] == 1 ? "" : "s") + ")";
+-        d.nodes[0] = d.nodes[1] = -1;
++        std::fill_n(d.nodes, kMaxNumaSlices, -1);
+         d.slice.clear();
+-        d.per[0] = d.per[1] = 0;
++        std::fill_n(d.per, kMaxNumaSlices, 0);
+         return d;
+     }
+     d.on = true;
+diff --git a/include/strata/kernels/cpu/pool.hpp b/include/strata/kernels/cpu/pool.hpp
+index 64c4a6cd..f01725f1 100644
+--- a/include/strata/kernels/cpu/pool.hpp
++++ b/include/strata/kernels/cpu/pool.hpp
+@@ -172,8 +172,9 @@ void restore_thread_affinity(const ThreadAffinity& previous);
+ struct NumaSplitPlan {
+     bool on = false;                  ///< split enabled
+     bool test = false;                ///< STRATA_NUMA_SPLIT=test: no real nodes, never places memory
+-    int nodes[2] = {-1, -1};          ///< real node id of slice 0 and 1 (ascending); -1 in test mode
+-    std::vector<int> cores[2];        ///< the cores the pool pinned for each slice (workers + host)
++    int slices = 2;
++    int nodes[kMaxNumaSlices] = {-1, -1, -1, -1};          ///< real node id of slice 0 and 1 (ascending); -1 in test mode
++    std::vector<int> cores[kMaxNumaSlices];        ///< the cores the pool pinned for each slice (workers + host)
+     std::string why;                  ///< reason when off ("" when on, or when the env var is unset)
+ };
+ /// The live pool's decision (set by the ExpertPool constructor, reset by its destructor); `on == false` when no
+@@ -401,7 +402,7 @@ private:
+     int hslice_ = 0;                  // the host's slice (when it drains)
+     std::vector<int> slice_threads_;  // threads draining each slice (the host counted in its own)
+     int64_t pub_ns_ = 0;              // the current mode-5/6 phase's publish time (host only)
+-    double slice_ms_[2] = {0.0, 0.0}; // accumulated per-slice drain time (host only)
++    double slice_ms_[kMaxNumaSlices] = {}; // accumulated per-slice drain time (host only)
+     bool numa_phase() const { return numa_n_ > 0 && mode_ >= 5; }
+     /// The claim of `claim()` on slice `slice`'s head: `base + i`, or -1.
+     int claim_slice(uint32_t epoch, int slice);
+diff --git a/include/strata/kernels/cpu/pool_plan.hpp b/include/strata/kernels/cpu/pool_plan.hpp
+index 743ae9e6..9f53cf3e 100644
+--- a/include/strata/kernels/cpu/pool_plan.hpp
++++ b/include/strata/kernels/cpu/pool_plan.hpp
+@@ -26,6 +26,7 @@ namespace strata::kernels::cpu {
+ /// The most default workers: past this the layer barrier costs more than the extra cores read (see the header comment).
+ /// Measured on 6c/12t (z440), 20c (P2003), 32c/64t (r9700) and 64c (l620): notes-152-users.md.
+ inline constexpr int kPoolWorkersCap = 32;
++inline constexpr int kMaxNumaSlices = 4;
+ /// Cores kept free for the other threads of the engine (copy / IO threads, the GPU driver's, the OS) on a CPU with at
+ /// least `kPoolReserveFrom` cores that the pool may use (besides the host's).  Small CPUs keep every core.
+ inline constexpr int kPoolReserveFrom = 16;
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 5decc0ed..d807cf2c 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -29,6 +29,10 @@
+ #endif
+ 
+ #include <algorithm>
++#include <cstdarg>
++#if defined(__linux__)
++#include <linux/mempolicy.h>
++#endif
+ #include <atomic>
+ #include <cassert>
+ #include <cerrno>
+@@ -179,8 +183,20 @@ uint64_t numa_pin_free(uint64_t global_free, const std::vector<uint64_t>& node_f
+ }
+ 
+ std::array<std::pair<uint64_t, uint64_t>, 3> numa_slice_ranges(uint64_t slot_off, const uint64_t role_bytes[3],
+-                                                               int slice, uint64_t page) {
+-    assert(slice == 0 || slice == 1);
++                                                               int slice, uint64_t page, int slices) {
++    assert((slices == 2 || slices == 4) && slice >= 0 && slice < slices);
++    if (slices == 4) {
++        std::array<std::pair<uint64_t, uint64_t>, 3> out{};
++        uint64_t start = slot_off;
++        for (int r = 0; r < 3; ++r) {
++            const uint64_t size = role_bytes[r], end = start + size;
++            const uint64_t lo = slice == 0 ? start / page * page : (start + size * slice / slices + page - 1) / page * page;
++            const uint64_t hi = std::min(end / page * page, (start + size * (slice + 1) / slices + page - 1) / page * page);
++            out[r] = hi > lo ? std::make_pair(lo, hi) : std::make_pair(lo, lo);
++            start = end;
++        }
++        return out;
++    }
+     std::array<std::pair<uint64_t, uint64_t>, 3> out{};
+     uint64_t start = slot_off;
+     for (int r = 0; r < 3; ++r) {
+@@ -579,10 +595,18 @@ void log_complement_memory(const char* stage, uint64_t requested) {
+ /// live pool split on real nodes; then the paced fault loop hands it each step to touch.
+ struct NumaComplementPlacement {
+     bool place = false;
+-    int nodes[2] = {-1, -1};
+-    int core[2] = {-1, -1};
+-    std::vector<std::pair<uint64_t, uint64_t>> ranges[2];   ///< page-aligned, sorted, coalesced, arena offsets
+-    uint64_t slice_bytes[2] = {0, 0};
++    int slices = 2;
++    const char* owner = "FileExpertSource";
++    void log(const char* format, ...) const {
++        constexpr const char* prefix = "FileExpertSource: ";
++        if (std::strncmp(format, prefix, std::strlen(prefix)) == 0) format += std::strlen(prefix);
++        std::fprintf(stderr, "%s: ", owner);
++        va_list args; va_start(args, format); std::vfprintf(stderr, format, args); va_end(args);
++    }
++    int nodes[4] = {-1, -1, -1, -1};
++    int core[4] = {-1, -1, -1, -1};
++    std::vector<std::pair<uint64_t, uint64_t>> ranges[4];   ///< page-aligned, sorted, coalesced, arena offsets
++    uint64_t slice_bytes[4] = {};
+     std::vector<uint64_t> free_before;                      ///< MemFree per node before the allocation
+     std::vector<uint64_t> free_after;                       ///< the same after the model files' pages are released
+     std::atomic<bool> pin_failed{false};
+@@ -619,32 +643,33 @@ struct NumaComplementPlacement {
+ 
+     /// Decides from the live pool's plan; false with a logged reason when the split is on but placement cannot run.
+     void init(const std::vector<uint64_t>& offsets, int64_t n_expert, const std::vector<uint64_t>& blob_bytes,
+-              const std::vector<uint64_t>& role_bytes) {
++              const std::vector<uint64_t>& role_bytes, const char* label = "FileExpertSource") {
+         // relies on the pool being built first (generate.cpp: the ExpertPool at ~5632, the complement at ~7690)
+         const auto& plan = strata::kernels::cpu::active_numa_split();
+         if (!plan.on || plan.test) return;
++        slices = plan.slices; owner = label;
+         free_before = node_free();
+         const char* why = nullptr;
+         if (role_bytes.size() != 3 * blob_bytes.size()) why = "this pack has no per-role byte sizes (not a GGUF-mapped native pack)";
+         for (size_t l = 0; why == nullptr && l < blob_bytes.size(); ++l)
+             if (role_bytes[3 * l] + role_bytes[3 * l + 1] + role_bytes[3 * l + 2] != blob_bytes[l])
+                 why = "the role sizes do not add up to the expert blob";
+-        for (int k = 0; why == nullptr && k < 2; ++k)
++        for (int k = 0; why == nullptr && k < slices; ++k)
+             if (plan.cores[k].empty()) why = "a slice has no core";
+             else if (plan.nodes[k] < 0 || plan.nodes[k] >= 64) why = "a node id is out of range";
+         if (why != nullptr) {
+-            std::fprintf(stderr, "FileExpertSource: WARNING: NUMA placement FAILED: %s; the complement is placed by "
++            log("FileExpertSource: WARNING: NUMA placement FAILED: %s; the complement is placed by "
+                                  "first touch as usual (the split runs with remote reads)\n", why);
+             return;
+         }
+-        for (int k = 0; k < 2; ++k) {
++        for (int k = 0; k < slices; ++k) {
+             nodes[k] = plan.nodes[k];
+             core[k] = plan.cores[k].front();   // workers come before the host core in the plan
+             std::vector<std::pair<uint64_t, uint64_t>> all;
+             for (size_t i = 0; i < offsets.size(); ++i) {
+                 if (offsets[i] == detail::kNoCacheComplement) continue;
+                 const size_t l = i / (size_t) n_expert;
+-                for (const auto& r : detail::numa_slice_ranges(offsets[i], &role_bytes[3 * l], k))
++                for (const auto& r : detail::numa_slice_ranges(offsets[i], &role_bytes[3 * l], k, 4096, slices))
+                     if (r.second > r.first) all.push_back(r);
+             }
+             std::sort(all.begin(), all.end());
+@@ -657,10 +682,16 @@ struct NumaComplementPlacement {
+         }
+         place = true;
+         t0 = std::chrono::steady_clock::now();
+-        std::fprintf(stderr, "FileExpertSource: NUMA placement of the complement: slice 0 -> node %d (%.2f GiB, toucher "
++        if (slices == 2) {
++        log("FileExpertSource: NUMA placement of the complement: slice 0 -> node %d (%.2f GiB, toucher "
+                              "CPU %d), slice 1 -> node %d (%.2f GiB, toucher CPU %d), 4 KiB pages; free before: %s\n",
+                      nodes[0], (double) slice_bytes[0] / 1073741824.0, core[0], nodes[1],
+                      (double) slice_bytes[1] / 1073741824.0, core[1], free_text(free_before).c_str());
++        } else {
++            log("NUMA placement of arena rows:");
++            for (int k = 0; k < slices; ++k) std::fprintf(stderr, " slice %d -> node %d (%.2f GiB, CPU %d);", k, nodes[k], double(slice_bytes[k]) / 1073741824.0, core[k]);
++            std::fprintf(stderr, " 4 KiB pages\n");
++        }
+     }
+ 
+     /// Touches one byte per page of each slice's ranges clipped to [lo, hi), one pinned thread per slice; then the
+@@ -673,6 +704,12 @@ struct NumaComplementPlacement {
+             CPU_ZERO(&set);
+             CPU_SET(core[k], &set);
+             if (sched_setaffinity(0, sizeof set, &set) != 0) pin_failed = true;
++            // Private four-node arena: reclaim local file cache rather than silently
++            // spilling to another node. This policy belongs only to this short-lived toucher.
++            if (slices == 4 && std::strcmp(owner, "ArenaExpertSource") == 0) {
++                const unsigned long mask = 1ul << nodes[k];
++                if (syscall(SYS_set_mempolicy, MPOL_BIND, &mask, 64ul) != 0) pin_failed = true;
++            }
+             const auto& rs = ranges[k];
+             auto it = std::partition_point(rs.begin(), rs.end(), [&](const auto& r) { return r.second <= lo; });
+             for (; it != rs.end() && it->first < hi; ++it)
+@@ -680,13 +717,14 @@ struct NumaComplementPlacement {
+                     ((volatile uint8_t*) arena)[at] = 0;
+         };
+         // CBA: a failed spawn terminates; fall back to an unpinned touch if it ever happens
+-        std::thread a(touch, 0), b(touch, 1);
+-        a.join();
+-        b.join();
+-        size_t c[2] = {0, 0};   // the pages no slice holds, as the default loop touches them
++        std::vector<std::thread> touchers;
++        try { for (int k = 0; k < slices; ++k) touchers.emplace_back(touch, k); }
++        catch (...) { for (auto& thread : touchers) thread.join(); throw; }
++        for (auto& thread : touchers) thread.join();
++        size_t c[4] = {};   // the pages no slice holds, as the default loop touches them
+         for (uint64_t at = lo; at < hi; at += 4096) {
+             bool covered = false;
+-            for (int k = 0; k < 2; ++k) {
++            for (int k = 0; k < slices; ++k) {
+                 while (c[k] < ranges[k].size() && ranges[k][c[k]].second <= at) ++c[k];
+                 covered = covered || (c[k] < ranges[k].size() && ranges[k][c[k]].first <= at);
+             }
+@@ -697,10 +735,10 @@ struct NumaComplementPlacement {
+     /// After the drop: a node whose free memory cannot take its slice plus `reserve_share` will spill to the other node
+     /// (no local reclaim); named up front, the 95 % check stays the verdict.
+     void check_room(uint64_t reserve_share) const {
+-        for (int k = 0; k < 2; ++k) {
++        for (int k = 0; k < slices; ++k) {
+             const uint64_t room = (size_t) nodes[k] < free_after.size() ? free_after[(size_t) nodes[k]] : 0;
+             if (room < slice_bytes[k] + reserve_share)
+-                std::fprintf(stderr, "FileExpertSource: WARNING: NUMA placement at risk: node %d has %.2f GiB free for its "
++                log("FileExpertSource: WARNING: NUMA placement at risk: node %d has %.2f GiB free for its "
+                                      "%.2f GiB slice plus %.2f GiB of reserve\n",
+                              nodes[k], (double) room / 1073741824.0, (double) slice_bytes[k] / 1073741824.0,
+                              (double) reserve_share / 1073741824.0);
+@@ -712,13 +750,13 @@ struct NumaComplementPlacement {
+     /// stopped early, `registered < bytes` that the driver did not page-lock all of it: the placement then fails.
+     void report(const uint8_t* arena, uint64_t got, uint64_t registered, uint64_t bytes, const char* stop) const {
+         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+-        uint64_t on_node[2] = {0, 0}, sampled[2] = {0, 0}, per_node[2][64] = {}, absent[2] = {0, 0};
++        uint64_t on_node[4] = {}, sampled[4] = {}, per_node[4][64] = {}, absent[4] = {};
+         constexpr int kNotSampled = -100000;   // outside any per-page status (a node id, or -errno)
+-        int sys_errno[2] = {0, 0};              // first errno of a failed move_pages batch, per slice
+-        size_t batches[2] = {0, 0}, failed[2] = {0, 0};
++        int sys_errno[4] = {};              // first errno of a failed move_pages batch, per slice
++        size_t batches[4] = {}, failed[4] = {};
+         std::vector<void*> pages;
+         std::vector<int> status;
+-        for (int k = 0; k < 2; ++k) {
++        for (int k = 0; k < slices; ++k) {
+             uint64_t n = 0;
+             pages.clear();
+             for (const auto& r : ranges[k])
+@@ -742,39 +780,45 @@ struct NumaComplementPlacement {
+             }
+             on_node[k] = nodes[k] >= 0 && nodes[k] < 64 ? per_node[k][nodes[k]] : 0;
+         }
+-        double share[2];
+-        for (int k = 0; k < 2; ++k) share[k] = sampled[k] > 0 ? 100.0 * (double) on_node[k] / (double) sampled[k] : 0.0;
+-        char what[2][96];   // a slice whose move_pages batches all failed has no share to print
+-        for (int k = 0; k < 2; ++k) {
++        double share[4];
++        for (int k = 0; k < slices; ++k) share[k] = sampled[k] > 0 ? 100.0 * (double) on_node[k] / (double) sampled[k] : 0.0;
++        char what[4][96];   // a slice whose move_pages batches all failed has no share to print
++        for (int k = 0; k < slices; ++k) {
+             if (batches[k] > 0 && failed[k] == batches[k]) std::snprintf(what[k], sizeof what[k], "not verified");
+             else std::snprintf(what[k], sizeof what[k], "%.2f GiB (%.1f %% of its slices)",
+                                share[k] / 100.0 * (double) slice_bytes[k] / 1073741824.0, share[k]);
+         }
+-        std::fprintf(stderr, "FileExpertSource: NUMA placement: node %d %s, node %d %s; free before: %s; after the drop: %s; "
++        if (slices == 2) {
++        log("FileExpertSource: NUMA placement: node %d %s, node %d %s; free before: %s; after the drop: %s; "
+                              "pages taken and page-locked in %.1f s since the placement started\n",
+                      nodes[0], what[0], nodes[1], what[1], free_text(free_before).c_str(), free_text(free_after).c_str(), secs);
++        } else {
++            log("NUMA placement:");
++            for (int k = 0; k < slices; ++k) std::fprintf(stderr, " node %d %s;", nodes[k], what[k]);
++            std::fprintf(stderr, " page-locked %llu of %llu bytes in %.1f s\n", (unsigned long long) registered, (unsigned long long) bytes, secs);
++        }
+         if (got < bytes)
+-            std::fprintf(stderr, "FileExpertSource: WARNING: NUMA placement FAILED: the paced loop stopped at %.2f of %.2f "
++            log("FileExpertSource: WARNING: NUMA placement FAILED: the paced loop stopped at %.2f of %.2f "
+                                  "GiB (%s); the rest is first-touched by unpinned copy threads (memory not placed on its node: the split runs with remote reads)\n",
+                          (double) got / 1073741824.0, (double) bytes / 1073741824.0, stop != nullptr ? stop : "?");
+         else if (registered < bytes)
+-            std::fprintf(stderr, "FileExpertSource: WARNING: NUMA placement FAILED: only %.2f of %.2f GiB page-locked (%s); "
++            log("FileExpertSource: WARNING: NUMA placement FAILED: only %.2f of %.2f GiB page-locked (%s); "
+                                  "the unregistered pages can be migrated by NUMA balancing (memory not placed on its node: the split runs with remote reads)\n",
+                          (double) registered / 1073741824.0, (double) bytes / 1073741824.0, stop != nullptr ? stop : "?");
+         if (pin_failed)
+-            std::fprintf(stderr, "FileExpertSource: WARNING: NUMA placement: a toucher could not be pinned to its core\n");
+-        for (int k = 0; k < 2; ++k) {
++            log("FileExpertSource: WARNING: NUMA placement: a toucher could not be pinned to its core\n");
++        for (int k = 0; k < slices; ++k) {
+             if (batches[k] > 0 && failed[k] == batches[k]) {
+-                std::fprintf(stderr, "FileExpertSource: WARNING: NUMA placement could not be verified: move_pages failed "
++                log("FileExpertSource: WARNING: NUMA placement could not be verified: move_pages failed "
+                                      "(errno %d: %s) for slice %d (node %d)\n", sys_errno[k], std::strerror(sys_errno[k]), k, nodes[k]);
+                 continue;
+             }
+             if (failed[k] > 0)
+-                std::fprintf(stderr, "FileExpertSource: WARNING: NUMA placement: move_pages failed (errno %d: %s) for %zu of %zu "
++                log("FileExpertSource: WARNING: NUMA placement: move_pages failed (errno %d: %s) for %zu of %zu "
+                                      "batches of slice %d; judged on the other samples\n", sys_errno[k],
+                              std::strerror(sys_errno[k]), failed[k], batches[k], k);
+             if (share[k] < 95.0)
+-                std::fprintf(stderr, "FileExpertSource: WARNING: NUMA placement FAILED: slice %d has %.1f %% of its pages "
++                log("FileExpertSource: WARNING: NUMA placement FAILED: slice %d has %.1f %% of its pages "
+                                      "on node %d (< 95 %%; of %llu sampled: node %d %llu, node %d %llu, not present %llu)\n",
+                              k, share[k], nodes[k], (unsigned long long) sampled[k], nodes[0],
+                              (unsigned long long) per_node[k][nodes[0]], nodes[1], (unsigned long long) per_node[k][nodes[1]],
+@@ -6189,7 +6233,42 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
+ #else
+     const bool deferred = false;
+ #endif
+-    PinnedArena* a = by_need ? new PinnedArena(arena_bytes + (uint64_t) blob, PinnedArena::ByNeed{}, need_ranges,
++#if defined(__linux__)
++    NumaComplementPlacement numa_arena;
++    const auto& numa_plan = strata::kernels::cpu::active_numa_split();
++    if (numa_plan.on && !numa_plan.test && numa_plan.slices == 4) {
++        if (!lay.native || !from_gguf || by_need || !shared_arena_file.empty() || arena_mmap) {
++            err = "four-node arena placement requires a private native GGUF arena (no mmap/shared/pin-by-need)";
++            return false;
++        }
++        std::vector<uint64_t> offsets((size_t) (n_layers * n_expert)), blobs, roles;
++        for (int64_t l = 0; l < n_layers; ++l) {
++            const auto& f = lay.fmt[(size_t) l];
++            if (f.tail_off != 0 || f.n_ff % 4 != 0 || f.n_embd % 4 != 0) {
++                err = "four-node arena placement needs four-way row boundaries and no auxiliary expert tail";
++                return false;
++            }
++            blobs.push_back(lay.blob_bytes(l));
++            roles.insert(roles.end(), {uint64_t(f.up_off), uint64_t(f.down_off - f.up_off), uint64_t(f.bytes - f.down_off)});
++            for (int64_t e = 0; e < n_expert; ++e) offsets[(size_t) (l * n_expert + e)] = lay.blob_offset(l, e);
++        }
++        numa_arena.init(offsets, n_expert, blobs, roles, "ArenaExpertSource");
++        if (!numa_arena.place) { err = "four-node arena placement was refused"; return false; }
++        numa_arena.free_after = numa_arena.free_before;
++        numa_arena.check_room(ram_keep_bytes / 4);
++    }
++    std::function<void(uint8_t*, uint64_t)> first_touch;
++    if (numa_arena.place) first_touch = [&](uint8_t* base, uint64_t bytes) {
++        constexpr uint64_t step = 1ull << 30;
++        for (uint64_t at = 0; at < bytes; at += step) numa_arena.touch_step(base, at, std::min(bytes, at + step));
++        if (numa_arena.pin_failed) throw std::runtime_error("NUMA toucher affinity or memory bind failed");
++    };
++#endif
++    PinnedArena* a =
++#if defined(__linux__)
++        first_touch ? new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes, shared_arena_file, pack_hash, first_touch) :
++#endif
++        by_need ? new PinnedArena(arena_bytes + (uint64_t) blob, PinnedArena::ByNeed{}, need_ranges,
+                                                max_pinned_bytes, shared_arena_file, pack_hash)
+                    : deferred ? new PinnedArena(want + (uint64_t) blob, bounds, PinnedArena::Deferred{})
+                               : new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes,
+@@ -6322,6 +6401,9 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
+         std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: %s %s (the next start maps it)\n",
+                      ok ? "wrote" : "could NOT write", path.c_str());
+     }
++#if defined(__linux__)
++    if (numa_arena.place) numa_arena.report(a->data(), want, a->registered_bytes, want, nullptr);
++#endif
+     arena_ = a;
+     base_ = a->data();
+     pinned_bytes_ = a->registered_bytes;
+diff --git a/src/core/pinned.cu b/src/core/pinned.cu
+index 81b9d191..cfbbaccb 100644
+--- a/src/core/pinned.cu
++++ b/src/core/pinned.cu
+@@ -139,9 +139,23 @@ uint64_t free_huge_bytes() {
+ // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
+ // hugepage-aligned file size and arena offset rather than the 4 KiB header layout used here.
+ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::string& shared_file,
+-              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes) {
++              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes, [[maybe_unused]] bool normal_pages = false) {
+     mapping_base = nullptr;
+     mapping_bytes = 0;
++#if defined(__linux__)
++    if (normal_pages) {
++        if (!shared_file.empty()) { note = "NUMA first-touch requires a private arena"; return nullptr; }
++        void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        if (p == MAP_FAILED) { note = "NUMA anonymous mmap failed"; return nullptr; }
++        if (madvise(p, bytes, MADV_NOHUGEPAGE) != 0) {
++            munmap(p, bytes); note = "NUMA 4 KiB page policy failed"; return nullptr;
++        }
++        got = PageBacking::NormalPages;
++        note = "4 KiB pages for NUMA expert-row placement";
++        mapping_base = p; mapping_bytes = bytes;
++        return p;
++    }
++#endif
+ 
+ #ifdef _WIN32
+     if (!shared_file.empty()) {
+@@ -736,9 +750,14 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, un
+ 
+ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
+                          uint64_t max_pinned_bytes, const std::string& shared_file,
+-                         uint64_t shared_pack_hash) : capacity(bytes) {
++                         uint64_t shared_pack_hash)
++    : PinnedArena(bytes, bounds, max_pinned_bytes, shared_file, shared_pack_hash, {}) {}
++
++PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
++                         uint64_t max_pinned_bytes, const std::string& shared_file,
++                         uint64_t shared_pack_hash, const std::function<void(uint8_t*, uint64_t)>& first_touch) : capacity(bytes) {
+     if (bytes == 0) return;
+-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
++    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes, bool(first_touch));
+     if (!shared_file.empty() && base != nullptr && mapping_base != nullptr)
+         shared_state = reinterpret_cast<std::atomic<uint64_t>*>(static_cast<char*>(mapping_base) +
+                                                                 offsetof(SharedArenaHeader, reserved));
+@@ -747,6 +766,18 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
+         mapping_bytes = bytes;
+     }
+ 
++    if (base && first_touch) {
++        try { first_touch((uint8_t*) base, bytes); }
++        catch (const std::exception& error) {
++#if defined(__linux__)
++            munmap(mapping_base, mapping_bytes);
++            mapping_base = nullptr; mapping_bytes = 0; base = nullptr;
++#endif
++            note = std::string("NUMA first-touch failed: ") + error.what();
++            return;
++        }
++    }
++
+     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
+     // that has already been faulted in page by page is far more expensive to register and may fail outright.
+     if (base && arena_no_register()) {
+diff --git a/src/kernels/cpu/numa_pool_test.cpp b/src/kernels/cpu/numa_pool_test.cpp
+index 58092f42..8a0d2484 100644
+--- a/src/kernels/cpu/numa_pool_test.cpp
++++ b/src/kernels/cpu/numa_pool_test.cpp
+@@ -136,6 +136,21 @@ int main() {
+         expect(!d.on, "every core on node 0: off");
+     }
+ 
++    // NPS4 is opt-in: default two-node decisions still refuse four nodes.
++    {
++        auto node_of4 = [](int core) { return core < 0 ? -1 : core / 16; };
++        std::vector<int> c;
++        for (int j=0;j<8;++j) for (int n=0;n<4;++n) c.push_back(n*16+j+(n==0));
++        c.push_back(0);
++        expect(!cpu::decide_numa_split(c,32,true,false,node_of4).on, "default retains the legacy two-node gate");
++        const auto d=cpu::decide_numa_split(c,32,true,false,node_of4,4);
++        expect(d.on && d.slices==4, "four-node plan enabled explicitly");
++        for (int n=0;n<4;++n) expect(d.nodes[n]==n && d.per[n]==(n==0?9:8), "all four nodes own their intended threads");
++        for (size_t j=0;j+1<c.size();++j) expect(d.slice[j]==int(j%4), "NPS4 interleaved workers");
++        expect(!cpu::decide_numa_split(c,32,false,false,node_of4,4).on, "four-node placement requires pinned workers");
++        expect(!cpu::decide_numa_split(c,32,true,true,node_of4,4).on, "four-node placement refuses moving expert slots");
++        expect(!cpu::decide_numa_split(c,32,true,false,node_of4,8).on, "unsupported group counts refuse safely");
++    }
+     fs::remove_all(tmp);
+     if (g_fail) {
+         std::fprintf(stderr, "numa_pool_test: %d failure(s)\n", g_fail);
+diff --git a/src/kernels/cpu/pool.cpp b/src/kernels/cpu/pool.cpp
+index a43b5c6e..f0803ca3 100644
+--- a/src/kernels/cpu/pool.cpp
++++ b/src/kernels/cpu/pool.cpp
+@@ -627,11 +627,11 @@ int numa_node_count() {
+ // The real-node split for threads on `thread_core` (numa_pool.hpp).  Linux only: the placement of the experts' memory
+ // (first touch by threads pinned to a node, move_pages to check) has no Windows or macOS version.
+ NumaSplitDecision decide_real_numa_split([[maybe_unused]] const std::vector<int>& thread_core, [[maybe_unused]] int n_workers,
+-                                         [[maybe_unused]] bool pinned) {
++                                         [[maybe_unused]] bool pinned, int slices = 2) {
+ #if defined(__linux__)
+     // the expert source's own reading of it (expert_source.cpp): exactly "1"
+     const char* rotate = std::getenv("STRATA_EXCHANGE_ROTATE");
+-    return decide_numa_split(thread_core, n_workers, pinned, rotate != nullptr && std::strcmp(rotate, "1") == 0, cpu_numa_node);
++    return decide_numa_split(thread_core, n_workers, pinned, rotate != nullptr && std::strcmp(rotate, "1") == 0, cpu_numa_node, slices);
+ #else
+     NumaSplitDecision d;
+     d.why = "the split needs Linux";
+@@ -751,13 +751,14 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
+     // 0.2.2: with 2 or more NUMA nodes and neither variable set the split is tried by itself, and STRATA_NUMA_POOL=0 turns that
+     // off (numa_pool.hpp).  One node: pick_numa_pool says Unchanged and nothing below differs from the pool before the split.
+     const char* env = std::getenv("STRATA_NUMA_SPLIT");
++    const int requested_slices = env != nullptr && (std::strcmp(env, "4") == 0 || std::strcmp(env, "test4") == 0) ? 4 : 2;
+     const int numa_nodes = numa_node_count();
+     const NumaPoolPick pool_pick = pick_numa_pool(std::getenv("STRATA_NUMA_POOL"), env, numa_nodes);
+     if (!pool_pick.log.empty()) std::fprintf(stderr, "%s\n", pool_pick.log.c_str());
+     if (pool_pick.choice == NumaPoolChoice::Off) env = nullptr;
+     bool auto_pool = pool_pick.choice == NumaPoolChoice::Auto;   // the split without STRATA_NUMA_SPLIT: only if it can run
+     bool env_off = !auto_pool && (env == nullptr || *env == '\0' || std::strcmp(env, "0") == 0);
+-    bool env_known = auto_pool || (!env_off && (std::strcmp(env, "1") == 0 || std::strcmp(env, "test") == 0));
++    bool env_known = auto_pool || (!env_off && (std::strcmp(env, "1") == 0 || std::strcmp(env, "4") == 0 || std::strcmp(env, "test") == 0 || std::strcmp(env, "test4") == 0));
+     const PoolPlanInput plan_in = pool_plan_input(topo_);
+     const PoolPlan wplan = plan_pool_workers(plan_in);
+     // --pool-cores (experimental, off by default): the person's own list of logical processors for the workers.  The plan above
+@@ -857,44 +858,44 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
+     // first instruction), and never revised.  Unset: the plan stays empty and nothing below runs.
+     NumaSplitPlan plan;
+     if (!env_off && !env_known) {
+-        plan.why = std::string("unknown STRATA_NUMA_SPLIT value '") + env + "' (use 1 or test)";
++        plan.why = std::string("unknown STRATA_NUMA_SPLIT value '") + env + "' (use 1, 4 or test)";
+         std::fprintf(stderr, "strata cpu pool: NUMA split off: %s\n", plan.why.c_str());
+     } else if (env_known) {
+-        plan.test = !auto_pool && std::strcmp(env, "test") == 0;
++        plan.test = !auto_pool && (std::strcmp(env, "test") == 0 || std::strcmp(env, "test4") == 0);
+         const int threads = n_ + (host_works_ ? 1 : 0);   // thread j < n_: worker j; j == n_: the host
+         std::vector<int> slice((size_t) threads, 0);
+         std::string why;
+-        if (threads < 2) {
+-            why = "the pool has " + std::to_string(threads) + " thread, the split needs 2 or more";
++        if (threads < requested_slices) {
++            why = "the pool has " + std::to_string(threads) + " thread, the split needs " + std::to_string(requested_slices) + " or more";
+         } else if (plan.test) {
+-            for (int j = 0; j < threads; ++j) slice[(size_t) j] = j % 2;
++            for (int j = 0; j < threads; ++j) slice[(size_t) j] = j % requested_slices;
+         } else {
+             std::vector<int> thread_core;
+             for (int j = 0; j < threads; ++j)
+                 thread_core.push_back(j == n_ ? topo_.host_core
+                                               : pin && j < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) j] : -1);
+-            const NumaSplitDecision d = decide_real_numa_split(thread_core, n_, pin);
++            const NumaSplitDecision d = decide_real_numa_split(thread_core, n_, pin, requested_slices);
+             why = d.why;
+             if (d.on) {
+                 slice = d.slice;
+-                plan.nodes[0] = d.nodes[0];
+-                plan.nodes[1] = d.nodes[1];
++                plan.slices = d.slices;
++                for (int k = 0; k < d.slices; ++k) plan.nodes[k] = d.nodes[k];
+                 for (int j = 0; j < threads; ++j) plan.cores[slice[(size_t) j]].push_back(thread_core[(size_t) j]);
+             }
+         }
+         plan.why = why;
+         plan.on = plan.why.empty();
+         if (!plan.on) {   // a refusal after the slices were planned (unbalanced) leaves no half-filled plan behind
+-            plan.nodes[0] = plan.nodes[1] = -1;
+-            plan.cores[0].clear();
+-            plan.cores[1].clear();
++            std::fill_n(plan.nodes, kMaxNumaSlices, -1);
++            for (auto& cores : plan.cores) cores.clear();
+         }
+         if (plan.on) {
+-            numa_n_ = 2;
+-            nsync_.reset(new NodeSync[2]);
++            numa_n_ = requested_slices;
++            plan.slices = numa_n_;
++            nsync_.reset(new NodeSync[numa_n_]);
+             wslice_.assign(slice.begin(), slice.begin() + n_);
+             hslice_ = host_works_ ? slice[(size_t) n_] : 0;
+-            slice_threads_.assign(2, 0);
++            slice_threads_.assign(numa_n_, 0);
+             for (int k : slice) ++slice_threads_[(size_t) k];
+             if (auto_pool)
+                 std::fprintf(stderr, "strata cpu pool: NUMA pool on: %d NUMA nodes found, one slice of the pool per node "
+@@ -902,9 +903,12 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
+             if (plan.test)
+                 std::fprintf(stderr, "strata cpu pool: NUMA split on (test, no real nodes): slice 0 = %d threads, "
+                                      "slice 1 = %d threads\n", slice_threads_[0], slice_threads_[1]);
+-            else
+-                std::fprintf(stderr, "strata cpu pool: NUMA split on: slice 0 = node %d (%d threads), slice 1 = node %d "
+-                                     "(%d threads)\n", plan.nodes[0], slice_threads_[0], plan.nodes[1], slice_threads_[1]);
++            else {
++                std::fprintf(stderr, "strata cpu pool: NUMA split on:");
++                for (int k = 0; k < numa_n_; ++k)
++                    std::fprintf(stderr, "%s slice %d = node %d (%d threads)", k ? "," : "", k, plan.nodes[k], slice_threads_[k]);
++                std::fprintf(stderr, "\n");
++            }
+         } else {
+             std::fprintf(stderr, "strata cpu pool: NUMA split off: %s\n", plan.why.c_str());
+         }
+@@ -1091,7 +1095,7 @@ int ExpertPool::numa_plan_phase(int per, int nb) {
+         ns.h = per * (k + 1) / numa_n_ - ns.row0;
+         ns.rows = (int64_t) nb * ns.h;
+         // about three tasks per thread of the slice's node; an explicit --pool-tasks is shared between the slices
+-        const int64_t want = tasks_ == 0 ? 3 * (int64_t) slice_threads_[(size_t) k] : (int64_t) (std::max)(1, tasks_ / 2);
++        const int64_t want = tasks_ == 0 ? 3 * (int64_t) slice_threads_[(size_t) k] : (int64_t) (std::max)(1, tasks_ / numa_n_);
+         ns.tasks = (int) (std::min)(want, ns.rows);
+         ns.base = base;
+         base += ns.tasks;
+diff --git a/src/kernels/cpu/pool_tasks_test.cpp b/src/kernels/cpu/pool_tasks_test.cpp
+index aa272880..7b38b053 100644
+--- a/src/kernels/cpu/pool_tasks_test.cpp
++++ b/src/kernels/cpu/pool_tasks_test.cpp
+@@ -118,14 +118,15 @@ int main(int argc, char** argv) {
+             }
+         // STRATA_NUMA_SPLIT=test: two slices without a real second node (thread j -> slice j % 2), every worker
+         // sleeping between batches (spin 0) so the late-wake path of issue #29 runs constantly
+-        put_env("STRATA_NUMA_SPLIT", "test");
++        for (int groups : {2,4}) {
++        put_env("STRATA_NUMA_SPLIT", groups==4 ? "test4" : "test");
+         put_env("STRATA_POOL_SPIN_US", "0");
+         for (bool host : {false, true}) for (int workers : {1, 2, 3, 5})
+             for (int tasks : {0, 1, 41, cpu::ExpertPool::kMaxTasks}) {
+                 cpu::ExpertPool pool(workers, false, host, cpu::PoolAffinity::All, tasks);
+-                const int slices = workers + (host ? 1 : 0) >= 2 ? 2 : 0;
+-                if (pool.numa_slices() != slices || cpu::active_numa_split().on != (slices == 2) ||
+-                    (slices == 2 && !cpu::active_numa_split().test)) {
++                const int slices = workers + (host ? 1 : 0) >= groups ? groups : 0;
++                if (pool.numa_slices() != slices || cpu::active_numa_split().on != (slices > 0) ||
++                    (slices > 0 && !cpu::active_numa_split().test)) {
+                     std::fprintf(stderr, "numa-split slices %d, expected %d (workers=%d host=%d)\n",
+                                  pool.numa_slices(), slices, workers, host);
+                     return 1;
+@@ -143,6 +144,8 @@ int main(int argc, char** argv) {
+                 }
+                 pool.diag(stderr);
+             }
++        }
++        put_env("STRATA_NUMA_SPLIT", "test");
+         // The split with modes 0-4 between the native batches, on one pool: a mode-0..4 batch lives on `head_`, a
+         // native one on the slice heads, so this alternates the two families of heads (a stale claim must fail on
+         // the other family) and runs the per-slice `parked` through the non-native modes.  The Strata-form kernels
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index ca2548d9..6eb2037b 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -7887,7 +7887,7 @@ int main(int argc, char** argv) {
+     if (pool.plan_limit()[0] != '\0' && !pool.explicit_cores())   // the default count: what it was bounded by (a configured count is never changed; --pool-cores has its own line below)
+         std::fprintf(stderr, "strata generate: CPU pool: %d workers by default (%d physical cores, %d logical processors; bounded by %s)\n",
+                      pool.workers(), pool.plan_cores(), pool.plan_logical(), pool.plan_limit());
+-    if (srcp == &arena_src && strata::kernels::cpu::active_numa_split().on && !strata::kernels::cpu::active_numa_split().test)
++    if (srcp == &arena_src && strata::kernels::cpu::active_numa_split().on && !strata::kernels::cpu::active_numa_split().test && strata::kernels::cpu::active_numa_split().slices == 2)
+         std::fprintf(stderr, "strata generate: NUMA split on, but this model's experts come from the arena path: memory is "
+                              "not placed per node (known limitation)\n");
+     if (pool.is_hybrid() && pool.affinity() != strata::kernels::cpu::PoolAffinity::All) {
+@@ -21349,8 +21349,10 @@ int main(int argc, char** argv) {
+                         pool.ms_multi_q / rounds, pool.ms_multi_down / rounds,
+                         (double) pool.multi_bytes / 1e6 / std::max(1e-9, pool.ms_multi_gu + pool.ms_multi_down),
+                         (drive.cpu_ms - pool_ms0) / rounds);
+-        if (rounds > 0 && pool.numa_slices() == 2)   // STRATA_NUMA_SPLIT: each slice's drain, publish to its last task
+-            std::printf("; numa slices: s0 %.3f ms  s1 %.3f ms", pool.numa_slice_ms(0) / rounds, pool.numa_slice_ms(1) / rounds);
++        if (rounds > 0 && pool.numa_slices() > 0) {
++            std::printf("; numa slices:");
++            for (int k = 0; k < pool.numa_slices(); ++k) std::printf(" s%d %.3f ms", k, pool.numa_slice_ms(k) / rounds);
++        }
+         if (rounds > 0) std::printf("\n");
+         if (rounds > 0)
+             std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
+diff --git a/tests/core/file_expert_source_test.cpp b/tests/core/file_expert_source_test.cpp
+index 3f3cf532..ef7cf931 100644
+--- a/tests/core/file_expert_source_test.cpp
++++ b/tests/core/file_expert_source_test.cpp
+@@ -474,6 +474,19 @@ void test_numa_slice_ranges() {
+     require(b[0].first <= 435200 + P && 435200 + P < b[0].second, "a slice-1 gate byte not in slice 1's gate range");
+     require(a[1].first <= 870400 && 870400 < a[1].second, "the gate/up boundary page was not slice 0's up range");
+     require(!(b[0].first <= 870400 && 870400 < b[0].second), "the gate/up boundary page was in slice 1's gate range");
++    // Four owners: no page may be raced across nodes, including tiny roles and adjacent slots.
++    for (const auto& role : {std::array<uint64_t,3>{870400,870400,921600}, std::array<uint64_t,3>{64,8192,300}}) {
++        const uint64_t total=role[0]+role[1]+role[2];
++        for (uint64_t off : offs) {
++            std::array<std::array<std::pair<uint64_t,uint64_t>,3>,8> ranges;
++            for (int slot=0;slot<2;++slot) for (int k=0;k<4;++k) ranges[4*slot+k]=numa_slice_ranges(off+slot*total,role.data(),k,P,4);
++            for (int a=0;a<8;++a) for (int b=a+1;b<8;++b) if (a%4 != b%4)
++                for (const auto& x:ranges[a]) for (const auto& y:ranges[b]) require(!meet(x,y), "NPS4 page has two NUMA owners");
++            for (const auto& group:ranges) for (const auto& r:group)
++                require(r.first<=r.second && r.first%P==0 && r.second%P==0,"NPS4 page range extent/alignment");
++        }
++    }
++
+ }
+ 
+ void test_resident_memory_budget() {

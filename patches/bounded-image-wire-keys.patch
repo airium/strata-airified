@@ -1,0 +1,15 @@
+diff --git a/serve/server.py b/serve/server.py
+index 91e4c4c6..7322cf17 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1721,7 +1721,9 @@ class StrataEngine:
+             keys += " ckpt=0"
+         # #2228: the pictures' keys (hex, in prompt order): the engine matches a picture by them, not by its embeddings
+         ik = sampling.get("strata_img_keys")
+-        if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
++        # Native img_keys are uint64 values. Oversized hashes overflow strtoull and
++        # alias to UINT64_MAX; omit invalid keys so native embedding hashes apply.
++        if isinstance(ik, list) and ik and all(isinstance(k, str) and 1 <= len(k) <= 16 and all(c in "0123456789abcdef" for c in k)
+                                                for k in ik):
+             keys += " img_keys=" + ",".join(ik)
+         # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a shared

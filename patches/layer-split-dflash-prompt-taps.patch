@@ -1,0 +1,31 @@
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index e3f3ded6..39bb7842 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -6268,6 +6268,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+         stats_.tokens += T;
+         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
+         pt.mark(kPfStart, cs);
++        // Every stage must deliver its taps before the hand-off skips the final-stage callback.
++#if defined(STRATA_HAVE_DFLASH2)
++        if (tap_rows > 0 && on_taps) {
++            if (cudaStreamSynchronize(m.cs) != cudaSuccess) { err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError()); return false; }
++            if (!on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
++        }
++#endif
+         if (next_ != nullptr) {
+             // The current hand-off slot was used two chunks ago.
+             float* h = m.hand[hand_buf_];
+@@ -6353,12 +6360,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                 std::fclose(f);
+             }
+         }
+-#if defined(STRATA_HAVE_DFLASH2)
+-        if (tap_rows > 0 && on_taps) {
+-            if (cudaStreamSynchronize(m.cs) != cudaSuccess) { err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+-            if (!on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
+-        }
+-#endif
+         if (on_chunk || on_stage_chunk) {
+             const auto toc = Clock::now();
+             if (cudaStreamSynchronize(m.cs) != cudaSuccess) {

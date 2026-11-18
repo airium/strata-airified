@@ -1,0 +1,48 @@
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index e429f317..10489101 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -4103,6 +4103,21 @@ void s27_launch_ts(bool ts, const NativeExpertLayout& L, int64_t cap_groups, cud
+                    const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                    const int32_t* ent_dst, const int32_t* ent_tok, const block_q8_1* X, float* gate, float* up, float* h,
+                    block_q8_1* hq, float* out, long long nh) {
++    // Turing experiment: fewer interleaved gate/up rows reduce register pressure
++    // and expose more blocks for the small expert groups of a verify window.
++    // Each row keeps its original lane-strided products and reduction order.
++    static const bool gu2 = [] {
++        const char* e = std::getenv("STRATA_EXPERT_V2K_GU_ROWS");
++        if (e == nullptr || std::strcmp(e, "4") == 0) return false;
++        if (std::strcmp(e, "2") == 0) return true;
++        std::fprintf(stderr, "STRATA_EXPERT_V2K_GU_ROWS: expected 2 or 4\n");
++        std::exit(1);
++    }();
++    if (gu2) {
++        if (ts) s27_launch<TG, TD, true, 2, 4, true>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh);
++        else s27_launch<TG, TD, true, 2, 4, false>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh);
++        return;
++    }
+     if (ts) s27_launch<TG, TD, true, 4, 4, true>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh);
+     else s27_launch<TG, TD, true, 4, 4, false>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh);
+ }
+diff --git a/src/kernels/iq_multi_parity.cpp b/src/kernels/iq_multi_parity.cpp
+index 162d1b6c..104ead14 100644
+--- a/src/kernels/iq_multi_parity.cpp
++++ b/src/kernels/iq_multi_parity.cpp
+@@ -336,6 +336,17 @@ void bench(cudaStream_t s, std::mt19937& rng) {
+         cudaFree(dw); cudaFree(dx); cudaFree(dxq); cudaFree(dy);
+     }
+     // the verify window's shape: 2560 x 640 experts, 16 groups of m entries each
++    for (int dt : {6, 8}) {
++        std::printf("Q4_K/%-7s grouped, 16 groups of m entries:", name_of(dt));
++        for (int m : {1, 2, 3, 4, 8}) {
++            Grouped G(12, dt, 2560, 640, std::vector<int>(16, m), 8, rng);
++            float us[2];
++            for (int old = 1; old >= 0; --old)
++                us[old] = 1e3f * time_ms(s, 50, [&] { G.run(old != 0, s); });
++            std::printf("  m=%d: %.1f/%.1f", m, us[1], us[0]);
++        }
++        std::printf("\n");
++    }
+     for (int gu : {16, 17, 18, 21, 22, 29}) {
+         std::printf("%-8s/Q2_0 grouped, 16 groups of m entries:", name_of(gu));
+         for (int m : {1, 2, 3, 4, 8}) {

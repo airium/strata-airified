@@ -1,0 +1,11 @@
+{
+  "context": 262144,
+  "kv": "int8",
+  "prefill": "auto",
+  "spec": 4,
+  "spec_min_p": 0.5,
+  "draft_conf": 0.35,
+  "layer_split": "auto",
+  "prompt_cache": 0,
+  "environment": {}
+}

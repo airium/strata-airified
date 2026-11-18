@@ -1,0 +1,66 @@
+diff --git a/src/prefill/gemm.cu b/src/prefill/gemm.cu
+index 01606188..d285ff0f 100644
+--- a/src/prefill/gemm.cu
++++ b/src/prefill/gemm.cu
+@@ -821,7 +821,6 @@ void bf16_to_f16(const uint16_t* in, uint16_t* out, int64_t n, cudaStream_t st)
+     if (n <= 0) return;
+     bf16_to_f16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, st>>>(in, reinterpret_cast<__half*>(out), n);
+ }
+-#if defined(STRATA_EXPERIMENTAL_SM60)   // Pascal runs only the experimental build
+ __global__ void bf16_to_f32_kernel(const uint16_t* __restrict__ in, float* __restrict__ out, int64_t n) {
+     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+     if (i < n) out[i] = __uint_as_float((uint32_t) in[i] << 16);
+@@ -830,7 +829,6 @@ void bf16_to_f32(const uint16_t* in, float* out, int64_t n, cudaStream_t st) {
+     if (n <= 0) return;
+     bf16_to_f32_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, st>>>(in, out, n);
+ }
+-#endif
+ // The current device's compute capability as 10 * major + minor, per device (a layer split can mix cards); 0: not
+ // known, read as "not an old card" so a failed query keeps the cuBLAS BF16 call.
+ int current_cc() {
+@@ -1123,7 +1121,16 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
+ #else
+     constexpr bool kPascalPath = false;
+ #endif
+-    if (const int path = K > 0 ? bf16_path_for_shape(N, K) : 0; (path == 1 && N > 1 && beta == 0.0f) || (path == 2 && kPascalPath)) {
++    // A separate opt-in evaluates cuBLAS SGEMM on exact BF16 -> FP32 copies
++    // against its BF16 SIMT fallback on Turing. No FP16 range/rounding change;
++    // accumulation order is still a library algorithm choice and needs checks.
++    static const bool f32_requested = [] {
++        const char* e = std::getenv("STRATA_BF16_F32");
++        return e != nullptr && e[0] == '1';
++    }();
++    const bool turing_f32 = f32_requested && current_cc() == 75 && ldx == 0 && !x_f16;
++    if (const int path = K > 0 ? (turing_f32 ? 2 : bf16_path_for_shape(N, K)) : 0;
++        (path == 1 && N > 1 && beta == 0.0f) || (path == 2 && (kPascalPath || turing_f32))) {
+         // FP16 (path 1) or FP32 (path 2, Pascal) copies of the weight and of X, converted in tiles.  Issue #1757: when
+         // the buffers did not fit in the VRAM that was left (a stage of a layer split keeps ~100 MiB), this fell through
+         // to the raw BF16 cuBLAS call, which a Pascal card answers with CUBLAS_STATUS_INTERNAL_ERROR (14).  Now the
+@@ -1151,7 +1158,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
+         }
+         if (!fit && path == 2) {   // Pascal has no BF16 cuBLAS call to fall back to; Volta keeps its raw one below
+             std::fprintf(stderr, "prefill gemm: no GPU memory left for the %s conversion buffers of a %lld x %lld BF16 weight "
+-                                 "(Pascal cards run the BF16 products through them); free VRAM on this card: raise "
++                                 "(the selected path uses FP32 products); free VRAM on this card: raise "
+                                  "--vram-reserve-mib, lower --max-context or --kv-resident, or give it fewer layers\n",
+                          "FP32", (long long) N, (long long) K);
+             std::exit(1);
+@@ -1160,7 +1167,6 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
+             for (int64_t n0 = 0; n0 < N; n0 += w_rows) {
+                 const int64_t nn = std::min<int64_t>(w_rows, N - n0);
+                 if (path == 2) {
+-#if defined(STRATA_EXPERIMENTAL_SM60)
+                     float* const wf = reinterpret_cast<float*>(tc_w_);
+                     float* const xf = reinterpret_cast<float*>(tc_x_);
+                     bf16_to_f32(W + n0 * K, wf, nn * K, (cudaStream_t) stream_);
+@@ -1169,9 +1175,8 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
+                         bf16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
+                         ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) nn, (int) n, (int) K, &alpha,
+                                        wf, (int) K, xf, (int) K, &beta, Y + t0 * ldy + n0, (int) ldy),
+-                           "cublasSgemm (bf16 on Pascal)");
++                           "cublasSgemm (BF16 operands widened to FP32)");
+                     }
+-#endif
+                 } else {
+                     bf16_to_f16(W + n0 * K, tc_w_, nn * K, (cudaStream_t) stream_);
+                     for (int64_t t0 = 0; t0 < T; t0 += x_rows) {

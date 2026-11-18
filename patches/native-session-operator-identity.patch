@@ -1,0 +1,19 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 5cb9405d..0e4cd4bb 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -12148,6 +12148,14 @@ int main(int argc, char** argv) {
+                         "STRATA_PF_FUSED", "STRATA_SELECT_SIMT", "STRATA_PA_V2T", "STRATA_GDN_CHUNKED", "STRATA_GDN_TC",
+                         "STRATA_ROUTE_TAIL_SKIP"})
+                     c.runtime_key += std::string(";") + name + "=" + (std::getenv(name) ? std::getenv(name) : "default");
++                // Native SAVE/RESTORE also works without the Python disk-cache
++                // namespace. Keep these operator variants separate there too.
++                // Only explicit values extend the legacy default key.
++                for (const char* name : {"STRATA_HC_Q8", "STRATA_HC_Q8_INJECT", "STRATA_HC_REQ8", "STRATA_GR_V3",
++                        "STRATA_GR_V3_SM75", "STRATA_HC_Q32_SM75", "STRATA_QFUSE_HC", "STRATA_FUSE_CONVAB",
++                        "STRATA_FUSE_HITS", "STRATA_SM75_HEAD_PF", "STRATA_MMVQ_IL_PF", "STRATA_QFUSE"})
++                    if (const char* value = std::getenv(name))
++                        c.runtime_key += std::string(";") + name + "=" + value;
+                 c.runtime_key += ";stage0=" + std::to_string(ss.layer_lo) + ":" + std::to_string(ss.layer_hi);
+                 for (const auto& stage : stages)
+                     c.runtime_key += ";stage=" + std::to_string(stage->lb) + ":" + std::to_string(stage->le);
